@@ -457,7 +457,12 @@ body {
   }
 
   &.code-cell .cell-input .cell-input-editor {
-    //min-height: 150px !important;
+    // making cell-input-editor content-editable means users can sometimes select it rather than the monaco editor itself.
+    // we can make it unselectable by setting pointer-events (we then need to make its child selectable again)
+    pointer-events: none;
+    .monaco-editor {
+      pointer-events: auto;
+    }
   }
 
   &.scala .cell-input .cell-input-tools button.run-cell {
@@ -1580,6 +1585,7 @@ button.inspect.icon-button {
   grid-template-areas: "head" "body";
   grid-template-rows: 2em 1fr;
   display: grid;
+  width: 100%;
 
   .ui-panel-content {
     display: inline-block;
@@ -1592,8 +1598,6 @@ button.inspect.icon-button {
   background-color: @ui-background;
   border-left: 1px solid @ui-border;
 
-  // so the ui-panel-content can scroll properly
-  position: absolute;
   max-height: 100%;
   width: 100%;
 
@@ -1659,6 +1663,53 @@ button.inspect.icon-button {
 
         background-color: #ffeef0;
         border: 1px solid #cc0000;
+      }
+
+      .child-tasks {
+        &:empty {
+          display: none;
+        }
+        padding: .5em 0 0;
+        margin-top: .5em;
+        border-top: 1px dotted @ui-border-light;
+
+        .task {
+          display: none;
+          height: 1.2em;
+          &.running {
+            display: block;
+          }
+
+          border: none;
+          background: transparent;
+          box-shadow: none;
+          padding: 0;
+          margin: 0;
+          position: relative;
+
+          h4 {
+            font-size: 100%;
+            font-weight: 400;
+            line-height: 1.2;
+            width: 50%;
+            position: absolute;
+            left: 0;
+            top: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+          }
+
+          .detail { display: none; }
+
+          .progress {
+            position: absolute;
+            right: 0;
+            top: 50%;
+            width: 50%;
+            margin-top: -2px;
+          }
+        }
       }
     }
 
@@ -1917,9 +1968,8 @@ button {
 }
 
 .grid-shell {
-  display: grid;
-  grid-template-rows: 1fr;
-  grid-template-columns: 1fr;
+  display: flex;
+  flex-direction: row;
   position: relative;
   background-color: @ui-background;
 }
@@ -2500,6 +2550,14 @@ button {
         color: green;
         margin-right: 2pt;
       }
+
+      button.cancel {
+        display: none;
+        .fas {
+          color: red;
+          margin-right: 2pt;
+        }
+      }
     }
 
     .numeric-field-title {
@@ -2627,6 +2685,19 @@ button {
       background: #ffeeee;
     }
   }
+
+  &.running {
+    .left-controls .control-buttons {
+      button.plot {
+        display: none;
+      }
+
+      button.cancel {
+        display: inline-block;
+      }
+    }
+
+  }
 }
 
 .undo-delete {
@@ -2753,29 +2824,29 @@ button {
       }
     }
   }
+}
 
-  .schema-display {
-    .object-summary {
-      .summary-content::before {
-        content: none;
-      }
-
-      .summary-content * {
-        display: none;
-      }
-
-      .summary-content::after {
-        content: 'struct';
-        font-family: @code-fonts;
-      }
-    }
-
-    .string {
-      color: inherit;
-    }
-
-    .string::before, .string::after { content: none; }
+.result-name-and-type {
+  font-family: @code-fonts;
+  font-weight: 400;
+  margin: 0;
+  button {
+    padding: 2px;
+    font-size: 10pt;
   }
+  button:first-of-type {
+    margin-left: 10pt;
+  }
+}
+
+.schema-display {
+
+  .object-fields .object-field {
+    .field-name::after {
+      content: none;
+    }
+  }
+
 }
 
 .tab-nav {

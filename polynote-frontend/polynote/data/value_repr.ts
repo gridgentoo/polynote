@@ -6,9 +6,11 @@ import {
 
 import match from "../util/match"
 
-import {GroupAgg, HandleData, Message, ModifyStream, QuantileBin, Select, TableOp} from "./messages";
+import * as messages from "./messages"
+import {CancelTasks, GroupAgg, HandleData, Message, ModifyStream, QuantileBin, Select, TableOp} from "./messages";
 import {MessageListener, SocketSession} from "../comms";
 import {DataType, DoubleType, LongType, NumericTypes, StructField, StructType} from "./data_type";
+import {Either, Left, Right} from "./types";
 
 export abstract class ValueRepr extends CodecContainer {
     static codec: Codec<ValueRepr>;
@@ -63,15 +65,15 @@ export class DataRepr extends ValueRepr {
 }
 
 export class LazyDataRepr extends ValueRepr {
-    static codec = combined(int32, DataType.codec).to(LazyDataRepr);
+    static codec = combined(int32, DataType.codec, optional(int32)).to(LazyDataRepr);
     static get handleTypeId() { return 0; }
     static get msgTypeId() { return 3; }
 
     static unapply(inst: LazyDataRepr): ConstructorParameters<typeof LazyDataRepr> {
-        return [inst.handle, inst.dataType];
+        return [inst.handle, inst.dataType, inst.knownSize];
     }
 
-    constructor(readonly handle: number, readonly dataType: DataType) {
+    constructor(readonly handle: number, readonly dataType: DataType, readonly knownSize: number | null) {
         super();
         Object.freeze(this);
     }
@@ -153,14 +155,13 @@ export class DataStream extends EventTarget {
     private runListener?: EventListener;
     private socketListener?: MessageListener;
     private onComplete?: <T>(value?: T | PromiseLike<T>) => void;
-    private onError?: (reason?: any) => void;
+    private _onError: (reason?: any) => void = _ => {};
     private nextPromise?: {resolve: <T>(value?: T | PromiseLike<T>) => void, reject: (reason?: any) => void}; // holds a Promise's `resolve` and `reject` inputs.
     private setupPromise?: Promise<Message | void>;
-    constructor(readonly path: string, private repr: StreamingDataRepr, readonly socket: SocketSession, mods?: TableOp[]) {
+    constructor(readonly path: string, private repr: StreamingDataRepr, mods?: TableOp[]) {
         super();
         this.path = path;
         this.repr = repr;
-        this.socket = socket;
         this.mods = mods || [];
         this.dataType = repr.dataType;
         this.dataType = this.finalDataType();
@@ -220,7 +221,7 @@ export class DataStream extends EventTarget {
         });
 
         const mod = new GroupAgg(groupCols, aggPairs);
-        return new DataStream(this.path, this.repr, this.socket, [...this.mods, mod]);
+        return new DataStream(this.path, this.repr, [...this.mods, mod]);
     }
 
     bin(col: string, binCount: number, err?: number) {
@@ -231,13 +232,18 @@ export class DataStream extends EventTarget {
         if (NumericTypes.indexOf(field.dataType) < 0) {
             throw new Error(`Field ${col} must be a numeric type to use bin()`);
         }
-        return new DataStream(this.path, this.repr, this.socket, [...this.mods, new QuantileBin(col, binCount, err)]);
+        return new DataStream(this.path, this.repr, [...this.mods, new QuantileBin(col, binCount, err)]);
     }
 
     select(...cols: string[]) {
         const fields = cols.map(col => this.requireField(col));
         const mod = new Select(cols);
-        return new DataStream(this.path, this.repr, this.socket, [...this.mods, mod]);
+        return new DataStream(this.path, this.repr, [...this.mods, mod]);
+    }
+
+    onError(fn: (cause: any) => void) {
+        const prevOnError = this._onError;
+        this._onError = prevOnError ? (cause: any) => { prevOnError(cause); fn(cause); } : fn;
     }
 
     /**
@@ -262,9 +268,15 @@ export class DataStream extends EventTarget {
 
         return this.setupStream().then(() => new Promise((resolve, reject) => {
             this.onComplete = resolve;
-            this.onError = reject;
+            const prevOnError = this._onError;
+            this._onError = prevOnError ? (cause: any) => { prevOnError(cause); reject(cause) } : reject;
             this._requestNext();
         }));
+    }
+
+    abort() {
+        SocketSession.get.send(new CancelTasks(this.path));
+        this.kill();
     }
 
     /**
@@ -289,32 +301,38 @@ export class DataStream extends EventTarget {
     }
 
     private _requestNext() {
-        this.socket.send(new HandleData(this.path, StreamingDataRepr.handleTypeId, this.repr.handle, this.batchSize, []))
+        SocketSession.get.send(new HandleData(this.path, StreamingDataRepr.handleTypeId, this.repr.handle, this.batchSize, Either.right([])))
     }
 
     private setupStream() {
         if (!this.socketListener) {
             const decodeValues = (data: ArrayBuffer[]) => data.map(buf => this.repr.dataType.decodeBuffer(new DataReader(buf)));
 
-            this.socketListener = this.socket.addMessageListener(HandleData, (path, handleType, handleId, count, data) => {
+            this.socketListener = SocketSession.get.addMessageListener(HandleData, (path, handleType, handleId, count, data: Left<messages.Error> | Right<ArrayBuffer[]>) => {
                 if (path === this.path && handleType === StreamingDataRepr.handleTypeId && handleId === this.repr.handle) {
-                    const batch = decodeValues(data);
-                    this.dispatchEvent(new DataBatch(batch));
-                    if (this.nextPromise) {
-                        this.nextPromise.resolve(batch);
-                        this.nextPromise = undefined;
-                    }
+                    const succeed = (data: ArrayBuffer[]) => {
+                        const batch = decodeValues(data);
+                        this.dispatchEvent(new DataBatch(batch));
+                        if (this.nextPromise) {
+                            this.nextPromise.resolve(batch);
+                            this.nextPromise = undefined;
+                        }
 
-                    if (batch.length < count) {
-                        this.kill();
-                    }
+                        if (batch.length < count) {
+                            this.kill();
+                        }
+                    };
+
+                    const fail = (err: messages.Error) => this._onError(err);
+
+                    Either.fold(data, fail, succeed);
                 }
             });
         }
 
         if (!this.setupPromise) {
             if (this.mods && this.mods.length > 0) {
-                this.setupPromise = this.socket.request(new ModifyStream(this.path, this.repr.handle, this.mods)).then(mod => {
+                this.setupPromise = SocketSession.get.request(new ModifyStream(this.path, this.repr.handle, this.mods)).then(mod => {
                     if (mod.newRepr) this.repr = mod.newRepr
                 });
             } else {

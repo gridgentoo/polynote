@@ -1,31 +1,19 @@
 "use strict";
 
-import {UIEvent} from "../util/ui_event";
 import {DataStream, LazyDataRepr, StreamingDataRepr, UpdatingDataRepr} from "../../data/value_repr";
 import {div, iconButton, span, table, TableElement, tag, TagElement} from "../util/tags";
 import {StructType, ArrayType, StructField, DataType} from "../../data/data_type";
 import {SocketSession} from "../../comms";
 
-export class ReprDataRequest extends UIEvent<{
-    handleType: number,
-    handleId: number,
-    count: number,
-    onComplete: (data: ArrayBuffer[]) => void,
-    onFail: () => void}>
-{
-    constructor(reprType: typeof LazyDataRepr | typeof StreamingDataRepr | typeof UpdatingDataRepr, handleId: number, count: number, onComplete: (data: ArrayBuffer[]) => void, onFail: () => void) {
-        super("ReprDataRequest", {handleType: reprType.handleTypeId, handleId, count, onComplete, onFail});
-    }
-}
-
-
-function renderData(dataType: DataType, data: any) {
+function renderData(dataType: DataType, data: any): HTMLElement {
     // TODO: nicer display
     let value = '';
     if (dataType instanceof ArrayType || dataType instanceof StructType) {
         value = JSON.stringify(data);
-    } else {
+    } else if (data !== null) {
         value = data.toString();
+    } else {
+        value = "<null>";
     }
     return span([], value).attr('title', value);
 }
@@ -47,7 +35,7 @@ export class TableView {
         const fieldClasses = dataType.fields.map(field => field.name);
         const fieldNames = dataType.fields.map(field => `${field.name}: ${field.dataType.typeName()}`);
 
-        if (!SocketSession.current.isOpen) {
+        if (!SocketSession.get.isOpen) {
             this.el = div(['table-view', 'disconnected'], [
                 "Not connected to server – must be connected in order to view data."
             ]);
@@ -74,7 +62,7 @@ export class TableView {
                 ])])
         );
 
-        this.stream = new DataStream(path, repr, SocketSession.current).batch(20);
+        this.stream = new DataStream(path, repr).batch(20);
         this.rows = [];
         this.currentPos = 0;
     }

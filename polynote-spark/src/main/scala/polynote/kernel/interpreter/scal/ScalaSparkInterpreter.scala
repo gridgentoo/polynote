@@ -3,16 +3,18 @@ package polynote.kernel.interpreter.scal
 import polynote.kernel.environment.CurrentNotebook
 import polynote.kernel.{BaseEnv, CellEnv, GlobalEnv, InterpreterEnv, ScalaCompiler, TaskManager}
 import polynote.kernel.interpreter.{Interpreter, State}
-import zio.{TaskR, ZIO}
+import zio.blocking.Blocking
+import zio.{RIO, ZIO}
 
 class ScalaSparkInterpreter private[scal] (
-  compiler: ScalaCompiler
-) extends ScalaInterpreter(compiler) {
+  compiler: ScalaCompiler,
+  indexer: ClassIndexer
+) extends ScalaInterpreter(compiler, indexer) {
   import scalaCompiler.global._
   override protected def transformCode(code: List[Tree]): List[Tree] =
     q"org.apache.spark.sql.catalyst.encoders.OuterScopes.addOuterScope(this)" :: super.transformCode(code)
 
-  override def init(state: State): TaskR[InterpreterEnv, State] = super.init(state).flatMap {
+  override def init(state: State): RIO[InterpreterEnv, State] = super.init(state).flatMap {
     parentState => run(ScalaSparkInterpreter.sparkPredef, State.predef(parentState, parentState))
   }
 }
@@ -31,12 +33,13 @@ object ScalaSparkInterpreter {
        |import org.apache.spark.sql.functions._
        |""".stripMargin
 
-  def apply(): TaskR[ScalaCompiler.Provider, ScalaSparkInterpreter] = ZIO.access[ScalaCompiler.Provider](_.scalaCompiler).map {
-    compiler => new ScalaSparkInterpreter(compiler)
-  }
+  def apply(): RIO[ScalaCompiler.Provider with Blocking, ScalaSparkInterpreter] = for {
+    compiler <- ZIO.access[ScalaCompiler.Provider](_.scalaCompiler)
+    index    <- ClassIndexer.default
+  } yield new ScalaSparkInterpreter(compiler, index)
 
   object Factory extends ScalaInterpreter.Factory {
-    override def apply(): TaskR[ScalaCompiler.Provider, ScalaSparkInterpreter] = {
+    override def apply(): RIO[ScalaCompiler.Provider with Blocking, ScalaSparkInterpreter] = {
       val res = ScalaSparkInterpreter()
       res
     }

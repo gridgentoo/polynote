@@ -11,7 +11,6 @@ import {isEqual} from "../util/functions";
 import {CellMetadata, NotebookCell, NotebookConfig} from "./data";
 import {ContentEdit} from "./content_edit";
 import {Left, Right} from "./types";
-import {DataType} from "./data_type";
 
 export abstract class Message extends CodecContainer {
     static codec: Codec<Message>;
@@ -184,12 +183,12 @@ export class ParamInfo {
 
 export class CompletionCandidate {
     static codec =
-        combined(tinyStr, arrayCodec(uint8, tinyStr), arrayCodec(uint8, arrayCodec(uint8, ParamInfo.codec)), shortStr, uint8).to(CompletionCandidate);
+        combined(tinyStr, arrayCodec(uint8, tinyStr), arrayCodec(uint8, arrayCodec(uint8, ParamInfo.codec)), shortStr, uint8, optional(shortStr)).to(CompletionCandidate);
     static unapply(inst: CompletionCandidate): ConstructorParameters<typeof CompletionCandidate> {
-        return [inst.name, inst.typeParams, inst.params, inst.type, inst.completionType];
+        return [inst.name, inst.typeParams, inst.params, inst.type, inst.completionType, inst.insertText];
     }
 
-    constructor(readonly name: string, readonly typeParams: string[], readonly params: ParamInfo[][], readonly type: string, readonly completionType: number) {
+    constructor(readonly name: string, readonly typeParams: string[], readonly params: ParamInfo[][], readonly type: string, readonly completionType: number, readonly insertText?: string) {
         Object.freeze(this);
     }
 }
@@ -292,13 +291,13 @@ export const TaskStatus = Object.freeze({
 });
 
 export class TaskInfo {
-    static codec = combined(tinyStr, tinyStr, shortStr, uint8, uint8).to(TaskInfo);
+    static codec = combined(tinyStr, tinyStr, shortStr, uint8, uint8, optional(tinyStr)).to(TaskInfo);
     static unapply(inst: TaskInfo): ConstructorParameters<typeof TaskInfo> {
-        return [inst.id, inst.label, inst.detail, inst.status, inst.progress];
+        return [inst.id, inst.label, inst.detail, inst.status, inst.progress, inst.parent];
     }
 
     constructor(readonly id: string, readonly label: string, readonly detail: string, readonly status: number,
-                readonly progress: number) {
+                readonly progress: number, readonly parent?: string) {
         Object.freeze(this);
     }
 }
@@ -445,7 +444,7 @@ export class ListNotebooks extends Message {
 }
 
 export class CreateNotebook extends Message {
-    static codec = combined(shortStr, optional(either(shortStr, str))).to(CreateNotebook);
+    static codec = combined(shortStr, optional(either(shortStr, str as Codec<string>))).to(CreateNotebook);
     static get msgTypeId() { return 14; }
     static unapply(inst: CreateNotebook): ConstructorParameters<typeof CreateNotebook> {
         return [inst.path, inst.uriOrContents];
@@ -488,14 +487,14 @@ export class ServerHandshake extends Message {
 
 
 export class HandleData extends Message {
-    static codec = combined(shortStr, uint8, int32, int32, arrayCodec(int32, bufferCodec)).to(HandleData);
+    static codec = combined(shortStr, uint8, int32, int32, either(Error.codec, arrayCodec(int32, bufferCodec))).to(HandleData);
     static get msgTypeId() { return 17; }
     static unapply(inst: HandleData): ConstructorParameters<typeof HandleData>{
         return [inst.path, inst.handleType, inst.handle, inst.count, inst.data];
     }
 
     constructor(readonly path: string, readonly handleType: number, readonly handle: number, readonly count: number,
-                readonly data: ArrayBuffer[]) {
+                readonly data: Left<Error> | Right<ArrayBuffer[]>) {
         super();
         Object.freeze(this);
     }

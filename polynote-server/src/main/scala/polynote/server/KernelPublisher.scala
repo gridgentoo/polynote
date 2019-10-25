@@ -13,101 +13,134 @@ import polynote.config.PolynoteConfig
 import polynote.env.ops._
 import polynote.kernel.environment.{Config, CurrentNotebook, Env, NotebookUpdates, PublishMessage, PublishResult, PublishStatus}
 import polynote.kernel.interpreter.Interpreter
-import polynote.messages.{CellID, CellResult, KernelStatus, Message, Notebook, NotebookUpdate, ShortString}
-import polynote.kernel.{BaseEnv, CellEnv, CellEnvT, ClearResults, Completion, Deque, GlobalEnv, Kernel, KernelBusyState, KernelStatusUpdate, Result, ScalaCompiler, Signatures, TaskB, TaskManager}
+import polynote.messages.{CellID, CellResult, KernelStatus, Message, Notebook, NotebookUpdate, ShortList, ShortString}
+import polynote.kernel.{BaseEnv, CellEnv, CellEnvT, ClearResults, Completion, Deque, ExecutionInfo, GlobalEnv, Kernel, KernelBusyState, KernelStatusUpdate, Result, ScalaCompiler, Signatures, TaskB, TaskManager}
 import polynote.util.VersionBuffer
-import zio.{Fiber, Promise, Semaphore, Task, TaskR, UIO, ZIO}
+import zio.{Fiber, Promise, Semaphore, Task, RIO, UIO, ZIO}
 import zio.interop.catz._
 import KernelPublisher.{GlobalVersion, SubscriberId}
 
+import scala.concurrent.duration.FiniteDuration
+
 class KernelPublisher private (
-  versionedNotebook: SignallingRef[Task, (GlobalVersion, Notebook)],
+  val versionedNotebook: SignallingRef[Task, (GlobalVersion, Notebook)],
   val versionBuffer: VersionBuffer[NotebookUpdate],
   publishUpdate: Publish[Task, (SubscriberId, NotebookUpdate)],
   val broadcastUpdates: Topic[Task, Option[(SubscriberId, NotebookUpdate)]],
   val status: Topic[Task, KernelStatusUpdate],
-  val cellResults: Topic[Task, CellResult],
+  val cellResults: Topic[Task, Option[CellResult]],
   val taskManager: TaskManager.Service,
   updater: Fiber[Throwable, Unit],
   kernelRef: Ref[Task, Option[Kernel]],
   kernelStarting: Semaphore,
+  queueingCell: Semaphore,
   kernelFactory: Kernel.Factory.Service,
-  closed: Promise[Throwable, Unit]
+  val closed: Promise[Throwable, Unit]
 ) {
-  val currentNotebook = new UnversionedRef(versionedNotebook)
   val publishStatus: Publish[Task, KernelStatusUpdate] = status
 
   private case class LocalCellEnv(notebookPath: ShortString, cellID: CellID, tapResults: Option[Result => Task[Unit]] = None) extends CellEnvT with NotebookUpdates {
-    override val currentNotebook: Ref[Task, Notebook] = KernelPublisher.this.currentNotebook
+    override val currentNotebook: Ref[Task, (GlobalVersion, Notebook)] = versionedNotebook
     override val taskManager: TaskManager.Service = KernelPublisher.this.taskManager
     override val publishStatus: Publish[Task, KernelStatusUpdate] = KernelPublisher.this.publishStatus
     override val publishResult: Publish[Task, Result] = {
-      val publish = Publish(cellResults.imap(_.result)(CellResult(notebookPath, cellID, _)))
+      val publish = Publish(cellResults).contramap[Result](result => Some(CellResult(notebookPath, cellID, result)))
       tapResults.fold(publish)(fn => publish.tap(fn))
     }
     override lazy val notebookUpdates: Stream[Task, NotebookUpdate] = broadcastUpdates.subscribe(128).unNone.map(_._2)
   }
 
   private def cellEnv(cellID: Int, tapResults: Option[Result => Task[Unit]] = None): Task[CellEnv] =
-    currentNotebook.get.map(nb => LocalCellEnv(nb.path, CellID(cellID), tapResults))
+    versionedNotebook.get.map {
+      case (_, nb) => LocalCellEnv(nb.path, CellID(cellID), tapResults)
+    }
 
-  private def kernelFactoryEnv: Task[CellEnv with NotebookUpdates] = currentNotebook.get.map(nb => LocalCellEnv(nb.path, CellID(-1)))
+  private def kernelFactoryEnv: Task[CellEnv with NotebookUpdates] = versionedNotebook.get.map {
+    case (_, nb) => LocalCellEnv(nb.path, CellID(-1))
+  }
 
   private val nextSubscriberId = new AtomicInteger(0)
 
+  /**
+    * @return A stream of all discrete versions of the notebook, even if the version number isn't updated. The version
+    *         number is updated only after a content change, while this stream will also contain a notebook for other
+    *         changes (such as results). See [[SignallingRef.discrete]] for the semantics of "discrete".
+    */
   def notebooks: Stream[Task, Notebook] = versionedNotebook.discrete.map(_._2).interruptWhen(closed.await.either)
+
+  /**
+    * @param duration The minimum delay between notebook versions
+    * @return A stream of notebook versions, which returns no more than one version per specified duration. When the
+    *         notebook is closed, emits one final version with no delay.
+    */
+  def notebooksTimed(duration: FiniteDuration): Stream[Task, Notebook] = {
+    import zio.interop.catz.implicits.ioTimer
+    (Stream.eval(versionedNotebook.get) ++ Stream.fixedDelay[UIO](duration).zipRight(versionedNotebook.continuous)).filterWithPrevious {
+      (previous, current) => !(previous eq current) && previous != current
+    }.map(_._2).interruptWhen(closed.await.either) ++ Stream.eval(versionedNotebook.get.map(_._2))
+  }
 
   def latestVersion: Task[(GlobalVersion, Notebook)] = versionedNotebook.get
 
   def update(subscriberId: SubscriberId, update: NotebookUpdate): Task[Unit] =
     publishUpdate.publish1((subscriberId, update))
 
-  def kernel: TaskR[BaseEnv with GlobalEnv, Kernel] = kernelRef.get.flatMap {
+  def kernel: RIO[BaseEnv with GlobalEnv, Kernel] = kernelRef.get.flatMap {
     case Some(kernel) => ZIO.succeed(kernel)
     case None => kernelStarting.withPermit {
       kernelRef.get.flatMap {
         case Some(kernel) => ZIO.succeed(kernel)
-        case None => for {
-          kernel <- createKernel()
-          _      <- kernel.init().provideSomeM(Env.enrichM[BaseEnv with GlobalEnv](cellEnv(-1)))
-          _      <- kernelRef.set(Some(kernel))
-          _      <- kernel.info() >>= publishStatus.publish1
-        } yield kernel
+        case None =>
+          val initKernel = for {
+              kernel <- createKernel()
+              _      <- kernel.init().provideSomeM(Env.enrichM[BaseEnv with GlobalEnv](cellEnv(-1)))
+              _      <- kernelRef.set(Some(kernel))
+              _      <- kernel.info() >>= publishStatus.publish1
+            } yield kernel
+
+          initKernel.tapError {
+            err => closed.succeed(())
+          }
       }
     }
   }
 
-  def killKernel(): TaskR[BaseEnv with GlobalEnv, Unit] = kernelRef.get.flatMap {
+  def killKernel(): RIO[BaseEnv with GlobalEnv, Unit] = kernelRef.get.flatMap {
     case None => ZIO.unit
     case Some(kernel) => kernelStarting.withPermit(kernel.shutdown() *> kernelRef.set(None))
   }
 
-  def restartKernel(forceStart: Boolean): TaskR[BaseEnv with GlobalEnv, Unit] = kernelRef.get.flatMap {
+  def restartKernel(forceStart: Boolean): RIO[BaseEnv with GlobalEnv, Unit] = kernelRef.get.flatMap {
     case None if forceStart => kernel.unit
     case None => ZIO.unit
     case Some(_) => killKernel() *> this.kernel.unit
   }
 
-  def queueCell(cellID: CellID): TaskR[BaseEnv with GlobalEnv, Task[Unit]] = {
-    val captureOut  = new Deque[Result]()
-    val saveResults = captureOut.toList.flatMap {
-      results => currentNotebook.update(_.setResults(cellID, results)).orDie
+  def queueCell(cellID: CellID): RIO[BaseEnv with GlobalEnv, Task[Unit]] = queueingCell.withPermit {
+    def writeResult(result: Result) = versionedNotebook.update {
+      case (ver, nb) => ver -> nb.updateCell(cellID) {
+        cell => result match {
+          case ClearResults() => cell.copy(results = ShortList(Nil))
+          case execInfo@ExecutionInfo(_, _) => cell.copy(results = ShortList(cell.results :+ execInfo), metadata = cell.metadata.copy(executionInfo = Some(execInfo)))
+          case result => cell.copy(results = ShortList(cell.results :+ result))
+        }
+      }
     }
 
     for {
-      env      <- cellEnv(cellID, tapResults = Some(captureOut.add))
+      env      <- cellEnv(cellID, tapResults = Some(writeResult))
       kernel   <- kernel
       result   <- kernel.queueCell(cellID).provideSomeM(Env.enrich[BaseEnv with GlobalEnv](env))
-    } yield result.ensuring(saveResults)
+    } yield result
   }
 
-  def completionsAt(cellID: CellID, pos: Int): TaskR[BaseEnv with GlobalEnv, List[Completion]] = for {
+  def completionsAt(cellID: CellID, pos: Int): RIO[BaseEnv with GlobalEnv, List[Completion]] = for {
     env         <- cellEnv(cellID)
     kernel      <- kernel
     completions <- kernel.completionsAt(cellID, pos).provideSomeM(Env.enrich[BaseEnv with GlobalEnv](env))
   } yield completions
 
-  def parametersAt(cellID: CellID, pos: Int): TaskR[BaseEnv with GlobalEnv, Option[Signatures]] = for {
+  def parametersAt(cellID: CellID, pos: Int): RIO[BaseEnv with GlobalEnv, Option[Signatures]] = for {
     env         <- cellEnv(cellID)
     kernel      <- kernel
     signatures  <- kernel.parametersAt(cellID, pos).provideSomeM(Env.enrich[BaseEnv with GlobalEnv](env))
@@ -125,16 +158,14 @@ class KernelPublisher private (
     } yield ()
   }.ignore
 
-  def subscribe(): TaskR[BaseEnv with GlobalEnv with PublishMessage, KernelSubscriber] = for {
-    versioned          <- versionedNotebook.get
-    (version, notebook) = versioned
+  def subscribe(): RIO[BaseEnv with GlobalEnv with PublishMessage, KernelSubscriber] = for {
     subscriberId       <- ZIO.effectTotal(nextSubscriberId.getAndIncrement())
-    subscriber         <- KernelSubscriber(subscriberId, this, version)
+    subscriber         <- KernelSubscriber(subscriberId, this)
   } yield subscriber
 
-  def close(): Task[Unit] = closed.succeed(()).const(())
+  def close(): Task[Unit] = closed.succeed(()).as(()) *> taskManager.shutdown()
 
-  private def createKernel(): TaskR[BaseEnv with GlobalEnv, Kernel] = kernelFactory()
+  private def createKernel(): RIO[BaseEnv with GlobalEnv, Kernel] = kernelFactory()
     .provideSomeM(Env.enrichM[BaseEnv with GlobalEnv](kernelFactoryEnv))
 }
 
@@ -164,17 +195,18 @@ object KernelPublisher {
     case (subscriberId, update) => ZIO(versions.add(update.globalVersion, update))
   }
 
-  def apply(notebook: Notebook): TaskR[BaseEnv with GlobalEnv, KernelPublisher] = for {
+  def apply(notebook: Notebook): RIO[BaseEnv with GlobalEnv, KernelPublisher] = for {
     kernelFactory    <- Kernel.Factory.access
     versionedRef     <- SignallingRef[Task, (GlobalVersion, Notebook)]((0, notebook))
     closed           <- Promise.make[Throwable, Unit]
     updates          <- Queue.unbounded[Task, Option[(SubscriberId, NotebookUpdate)]]
     broadcastUpdates <- Topic[Task, Option[(SubscriberId, NotebookUpdate)]](None)
     broadcastStatus  <- Topic[Task, KernelStatusUpdate](KernelBusyState(busy = false, alive = false))
-    broadcastResults <- Topic[Task, CellResult](CellResult(notebook.path, CellID(-1), ClearResults()))
+    broadcastResults <- Topic[Task, Option[CellResult]](None)
     taskManager      <- TaskManager(broadcastStatus)
     versionBuffer     = new VersionBuffer[NotebookUpdate]
     kernelStarting   <- Semaphore.make(1)
+    queueingCell     <- Semaphore.make(1)
     kernel           <- Ref[Task].of[Option[Kernel]](None)
     subscriberVersions = new ConcurrentHashMap[SubscriberId, (GlobalVersion, Int)]()
     updater          <- updates.dequeue.unNoneTerminate
@@ -191,6 +223,7 @@ object KernelPublisher {
     updater,
     kernel,
     kernelStarting,
+    queueingCell,
     kernelFactory,
     closed
   )

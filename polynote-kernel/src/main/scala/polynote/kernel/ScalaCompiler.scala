@@ -1,30 +1,32 @@
 package polynote.kernel
 
 import java.io.File
+import java.net.URL
 
 import cats.syntax.traverse._
 import cats.instances.list._
 import polynote.kernel.environment.Config
 import polynote.kernel.util.{KernelReporter, LimitedSharingClassLoader, pathOf}
-import polynote.runtime.python.TypedPythonObject
 import zio.blocking.Blocking
 import zio.system.{System, env}
 import zio.internal.{ExecutionMetrics, Executor}
-import zio.{Task, TaskR, ZIO}
+import zio.{Task, RIO, ZIO}
 import zio.interop.catz._
 
 import scala.collection.mutable
 import scala.reflect.internal.util.{AbstractFileClassLoader, NoSourceFile, Position, SourceFile}
 import scala.reflect.io.VirtualDirectory
 import scala.reflect.runtime.universe
-import scala.runtime.BoxedUnit
 import scala.tools.nsc.Settings
 import scala.tools.nsc.interactive.Global
+import scala.reflect.internal.util.ScalaClassLoader.URLClassLoader
 
 class ScalaCompiler private (
   val global: Global,
   val notebookPackage: String,
-  val classLoader: Task[AbstractFileClassLoader]
+  val classLoader: Task[AbstractFileClassLoader],
+  val dependencies: List[File],
+  val otherClasspath: List[File]
 ) {
   import global._
   private val packageName = TermName(notebookPackage)
@@ -81,15 +83,15 @@ class ScalaCompiler private (
   }
 
 
-  def formatType(typ: Type): TaskR[Blocking, String] =
+  def formatType(typ: Type): RIO[Blocking, String] =
     zio.blocking.effectBlocking(formatTypeInternal(typ)).lock(compilerThread)
 
-  def formatTypes(types: List[Type]): TaskR[Blocking, List[String]] =
+  def formatTypes(types: List[Type]): RIO[Blocking, List[String]] =
     zio.blocking.effectBlocking(types.map(formatTypeInternal)).lock(compilerThread)
 
   def compileCell(
     cellCode: CellCode
-  ): TaskR[Blocking, Class[_]] =
+  ): RIO[Blocking, Class[_]] =
     for {
       compiled  <- cellCode.compile()
       className  = s"${packageName.encodedName.toString}.${cellCode.assignedTypeName.encodedName.toString}"
@@ -121,22 +123,22 @@ class ScalaCompiler private (
   }
 
   // TODO: currently, there's no caching of the implicits, because what if you define a new implicit? Should we cache?
-  def inferImplicits(types: List[Type]): TaskR[Blocking, List[Option[AnyRef]]] = {
+  def inferImplicits(types: List[Type]): RIO[Blocking, List[Option[AnyRef]]] = {
     val (names, trees) = types.map {
       typ =>
-        val name = freshTermName("anon$")(currentFreshNameCreator)
+        val name = freshTermName("anon$")(globalFreshNameCreator)
         name.encodedName.toString -> q"val $name: ${TypeTree(typ)} = implicitly[${TypeTree(typ)}]"
     }.unzip
 
     val cellName = "anonImplicits"
 
-    def construct: TaskR[Class[_], AnyRef] =
+    def construct: RIO[Class[_], AnyRef] =
       ZIO.accessM[Class[_]](cls => ZIO(cls.getDeclaredConstructors.head.newInstance().asInstanceOf[AnyRef]))
 
-    def getField(name: String)(instance: AnyRef): TaskR[Class[_], Option[AnyRef]] =
+    def getField(name: String)(instance: AnyRef): RIO[Class[_], Option[AnyRef]] =
       ZIO.accessM[Class[_]](cls => ZIO(Option(cls.getDeclaredMethod(name).invoke(instance))) orElse ZIO.succeed(None))
 
-    def getFields(names: List[String])(instance: AnyRef): TaskR[Class[_], List[Option[AnyRef]]] =
+    def getFields(names: List[String])(instance: AnyRef): RIO[Class[_], List[Option[AnyRef]]] =
       names.map(getField(_)(instance)).sequence
 
     // first we'll try to get all of them at once.
@@ -183,7 +185,7 @@ class ScalaCompiler private (
 
 
     // The name of the class (and its companion object, in case one is needed)
-    lazy val assignedTypeName: TypeName = freshTypeName(s"$name$$")(global.currentFreshNameCreator)
+    lazy val assignedTypeName: TypeName = freshTypeName(s"$name$$")(global.globalFreshNameCreator)
     lazy val assignedTermName: TermName = assignedTypeName.toTermName
 
     private lazy val priorCellNames = priorCells.map(_.assignedTypeName)
@@ -329,8 +331,8 @@ class ScalaCompiler private (
     }
 
     // the type representing this cell's class. It may be null or NoType if invoked before compile is done!
-    def cellClassType: Type = exitingTyper(wrappedClass.symbol.info)
-    def cellClassSymbol: ClassSymbol = exitingTyper(wrappedClass.symbol.asClass)
+    lazy val cellClassType: Type = exitingTyper(wrappedClass.symbol.info)
+    lazy val cellClassSymbol: ClassSymbol = exitingTyper(wrappedClass.symbol.asClass)
     lazy val cellCompanionSymbol: ModuleSymbol = exitingTyper(companion.symbol.asModule)
     lazy val cellInstSymbol: Symbol = exitingTyper(cellCompanionSymbol.info.member(TermName("instance")).accessedOrSelf)
     lazy val cellInstType: Type = exitingTyper(cellCompanionSymbol.info.member(TypeName("Inst")).info.dealias)
@@ -356,6 +358,13 @@ class ScalaCompiler private (
         reporter.attempt {
           run.compileUnits(List(compilationUnit), run.namerPhase)
           exitingTyper(compilationUnit.body)
+          // materialize these lazy vals now while the run is still active
+          val _1 = cellClassSymbol
+          val _2 = cellClassType
+          val _3 = cellCompanionSymbol
+          val _4 = cellInstSymbol
+          val _5 = cellInstType
+          val _6 = typedOutputs
         }
       }.lock(compilerThread).absolve
     }.flatten
@@ -458,62 +467,73 @@ class ScalaCompiler private (
 
 object ScalaCompiler {
 
+  def access: ZIO[Provider, Nothing, ScalaCompiler]    = ZIO.access[ScalaCompiler.Provider](_.scalaCompiler)
+  def settings: ZIO[Provider, Nothing, Settings]       = access.map(_.global.settings)
+  def dependencies: ZIO[Provider, Nothing, List[File]] = access.map(_.dependencies)
+
   def apply(settings: Settings, classLoader: Task[AbstractFileClassLoader], notebookPackage: String = "$notebook"): Task[ScalaCompiler] =
     classLoader.memoize.flatMap {
       classLoader => ZIO {
         val global = new Global(settings, KernelReporter(settings))
-        new ScalaCompiler(global, notebookPackage, classLoader)
+        new ScalaCompiler(global, notebookPackage, classLoader, Nil, settings.classpath.value.split(File.pathSeparatorChar).toList.map(new File(_)))
       }
     }
 
   def apply(
     dependencyClasspath: List[File],
+    otherClasspath: List[File],
     modifySettings: Settings => Settings
-  ): TaskR[Config with System, ScalaCompiler] = for {
-    settings          <- ZIO(modifySettings(defaultSettings(new Settings(), dependencyClasspath)))
+  ): RIO[Config with System, ScalaCompiler] = for {
+    settings          <- ZIO(modifySettings(defaultSettings(new Settings(), dependencyClasspath ++ otherClasspath)))
     global            <- ZIO(new Global(settings, KernelReporter(settings)))
     notebookPackage    = "$notebook"
     classLoader       <- makeClassLoader(settings).memoize
-  } yield new ScalaCompiler(global, notebookPackage, classLoader)
+  } yield new ScalaCompiler(global, notebookPackage, classLoader, dependencyClasspath, otherClasspath)
 
-  def makeClassLoader(settings: Settings): TaskR[Config, AbstractFileClassLoader] = for {
+  def makeClassLoader(settings: Settings): RIO[Config, AbstractFileClassLoader] = for {
     dependencyClassLoader <- makeDependencyClassLoader(settings)
     compilerOutput        <- ZIO.fromOption(settings.outputDirs.getSingleOutput).mapError(_ => new IllegalArgumentException("Compiler must have a single output directory"))
   } yield new AbstractFileClassLoader(compilerOutput, dependencyClassLoader)
 
-  def makeDependencyClassLoader(settings: Settings): TaskR[Config, ClassLoader] = Config.access.flatMap {
+  def makeDependencyClassLoader(settings: Settings): RIO[Config, URLClassLoader] = Config.access.flatMap {
     config => ZIO {
       val dependencyClassPath = settings.classpath.value.split(File.pathSeparator).toSeq.map(new File(_).toURI.toURL)
 
       if (config.behavior.dependencyIsolation) {
         new LimitedSharingClassLoader(
-          "^(scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j)\\.",
+          "^(scala|javax?|jdk|sun|com.sun|com.oracle|polynote|org.w3c|org.xml|org.omg|org.ietf|org.jcp|org.apache.spark|org.spark_project|org.glassfish.jersey|org.jvnet.hk2|org.apache.hadoop|org.codehaus|org.slf4j|org.log4j|org.apache.log4j)\\.",
           dependencyClassPath,
           getClass.getClassLoader)
       } else {
-        new scala.reflect.internal.util.ScalaClassLoader.URLClassLoader(dependencyClassPath, getClass.getClassLoader)
+        new URLClassLoader(dependencyClassPath, getClass.getClassLoader)
       }
     }
   }
 
   def provider(
     dependencyClasspath: List[File],
+    otherClasspath: List[File],
     modifySettings: Settings => Settings
-  ): TaskR[Config with System, ScalaCompiler.Provider] = apply(dependencyClasspath, modifySettings).map(Provider.of)
+  ): RIO[Config with System, ScalaCompiler.Provider] = apply(dependencyClasspath, otherClasspath, modifySettings).map(Provider.of)
 
-  def provider(dependencyClasspath: List[File]): TaskR[Config with System, ScalaCompiler.Provider] =
-    provider(dependencyClasspath, identity[Settings])
+  def provider(dependencyClasspath: List[File], otherClasspath: List[File]): RIO[Config with System, ScalaCompiler.Provider] =
+    provider(dependencyClasspath, otherClasspath, identity[Settings])
 
-  val requiredPaths = List(
-    pathOf(classOf[List[_]]),
-    pathOf(polynote.runtime.Runtime.getClass),
-    pathOf(classOf[scala.reflect.runtime.JavaUniverse]),
-    pathOf(classOf[scala.tools.nsc.Global]),
-    pathOf(classOf[jep.python.PyObject])
-  ).distinct.map {
+  private def pathAsFile(url: URL): File = url match {
     case url if url.getProtocol == "file" => new File(url.getPath)
     case url => throw new IllegalStateException(s"Required path $url must be a local file, not ${url.getProtocol}")
   }
+
+  val requiredPolynotePaths: List[File] = List(
+    pathOf(polynote.runtime.Runtime.getClass),
+    pathOf(classOf[jep.python.PyObject])
+  ).map(pathAsFile)
+
+  val requiredPaths: List[File] = requiredPolynotePaths ++ List(
+    pathOf(classOf[List[_]]),
+    pathOf(classOf[scala.reflect.runtime.JavaUniverse]),
+    pathOf(classOf[scala.tools.nsc.Global])
+  ).distinct.map(pathAsFile)
 
   def defaultSettings(initial: Settings, classPath: List[File] = Nil): Settings = {
     val cp = classPath ++ requiredPaths

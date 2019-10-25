@@ -7,13 +7,14 @@ import java.lang.reflect.{Constructor, InvocationTargetException}
 import scala.reflect.internal.util.NoPosition
 import scala.tools.nsc.interactive.Global
 import polynote.messages.CellID
-import zio.blocking.Blocking
-import zio.{Task, TaskR, ZIO}
+import zio.blocking.{Blocking, effectBlocking}
+import zio.{Task, RIO, ZIO}
 import ScalaInterpreter.{addPositionUpdates, captureLastExpression}
 import polynote.kernel.environment.CurrentRuntime
 
 class ScalaInterpreter private[scal] (
-  val scalaCompiler: ScalaCompiler
+  val scalaCompiler: ScalaCompiler,
+  indexer: ClassIndexer
 ) extends Interpreter {
   import scalaCompiler.{CellCode, global, Imports}
   import global.{Tree, ValDef, TermName, Modifiers, EmptyTree, TypeTree, Import, Name, Type, Quasiquote, typeOf, atPos, NoType}
@@ -22,7 +23,7 @@ class ScalaInterpreter private[scal] (
   // Interpreter interface methods //
   ///////////////////////////////////
 
-  override def run(code: String, state: State): TaskR[InterpreterEnv, State] = for {
+  override def run(code: String, state: State): RIO[InterpreterEnv, State] = for {
     collectedState <- injectState(collectState(state))
     valDefs         = collectedState.values.mapValues(_._1).values.toList
     cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", code, collectedState.prevCells, valDefs, collectedState.imports)
@@ -37,16 +38,18 @@ class ScalaInterpreter private[scal] (
   override def completionsAt(code: String, pos: Int, state: State): Task[List[Completion]] = for {
     collectedState   <- injectState(collectState(state)).provide(CurrentRuntime.NoCurrentRuntime)
     valDefs           = collectedState.values.mapValues(_._1).values.toList
-    cellCode         <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n$code", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
-  } yield completer.completions(cellCode, pos + 1)
+    cellCode         <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n${code.substring(0, math.min(pos, code.length))}", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
+    completions      <- completer.completions(cellCode, pos + 1)
+  } yield completions
 
   override def parametersAt(code: String, pos: Int, state: State): Task[Option[Signatures]] = for {
     collectedState <- injectState(collectState(state)).provide(CurrentRuntime.NoCurrentRuntime)
     valDefs         = collectedState.values.mapValues(_._1).values.toList
-    cellCode         <- scalaCompiler.cellCode(s"Cell${state.id.toString}", code, collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
-  } yield completer.paramHints(cellCode, pos)
+    cellCode       <- scalaCompiler.cellCode(s"Cell${state.id.toString}", s"\n$code", collectedState.prevCells, valDefs, collectedState.imports, strictParse = false)
+    hints          <- completer.paramHints(cellCode, pos + 1)
+  } yield hints
 
-  override def init(state: State): TaskR[InterpreterEnv, State] = ZIO.succeed(state)
+  override def init(state: State): RIO[InterpreterEnv, State] = ZIO.succeed(state)
 
   override def shutdown(): Task[Unit] = ZIO.unit
 
@@ -58,7 +61,7 @@ class ScalaInterpreter private[scal] (
     * Overrideable method to inject some pre-defined state (values and imports) into the initial cell. The base implementation
     * injects the `kernel` value, making it available to the notebook. Override to inject more imports or values.
     */
-  protected def injectState(collectedState: CollectedState): TaskR[CurrentRuntime, CollectedState] =
+  protected def injectState(collectedState: CollectedState): RIO[CurrentRuntime, CollectedState] =
     ZIO.access[CurrentRuntime](_.currentRuntime).map {
       kernelRuntime =>
         collectedState.copy(values = collectedState.values + (runtimeValDef.name.toString -> (runtimeValDef, kernelRuntime: Any)))
@@ -90,7 +93,7 @@ class ScalaInterpreter private[scal] (
   // Private scala-specific stuff //
   //////////////////////////////////
 
-  private val completer = ScalaCompleter(scalaCompiler)
+  private val completer = ScalaCompleter(scalaCompiler, indexer)
 
   // create the parameter that's used to inject the `kernel` value into cell scope
   private def runtimeValDef = ValDef(Modifiers(), TermName("kernel"), tq"polynote.runtime.KernelRuntime", EmptyTree)
@@ -106,7 +109,12 @@ class ScalaInterpreter private[scal] (
       val valuesMap = values.map(v => v.name -> v.value).toMap
       val inputs = cellCode.typedOutputs.map(_.duplicate.setPos(NoPosition))
         .flatMap {
-          v => valuesMap.get(v.name.decodedName.toString).map(value => v.name.encodedName.toString -> (v, value)).toList
+          v =>
+            val (nameString, input) = v.name.decodedName.toString match {
+              case "$Out" => "Out" -> v.copy(name = TermName("Out"))
+              case name   => name -> v
+            }
+            valuesMap.get(nameString).map(value => nameString -> (input, value)).toList
         }.toMap
       (inputs, Option(cellCode))
     case state =>
@@ -184,14 +192,18 @@ class ScalaInterpreter private[scal] (
   case class ScalaCellState(id: CellID, prev: State, values: List[ResultValue], cellCode: CellCode, instance: AnyRef) extends State {
     override def withPrev(prev: State): ScalaCellState = copy(prev = prev)
     override def updateValues(fn: ResultValue => ResultValue): State = copy(values = values.map(fn))
+    override def updateValuesM[R](fn: ResultValue => RIO[R, ResultValue]): RIO[R, State] =
+      ZIO.sequence(values.map(fn)).map(values => copy(values = values))
   }
 
 }
 
 object ScalaInterpreter {
-  def apply(): TaskR[ScalaCompiler.Provider, ScalaInterpreter] = ZIO.access[ScalaCompiler.Provider](_.scalaCompiler).map {
-    compiler => new ScalaInterpreter(compiler)
-  }
+
+  def apply(): RIO[Blocking with ScalaCompiler.Provider, ScalaInterpreter] = for {
+    compiler <- ZIO.access[ScalaCompiler.Provider](_.scalaCompiler)
+    index    <- ClassIndexer.default
+  } yield new ScalaInterpreter(compiler, index)
 
   // capture the last statement in a value Out, if it's a free expression
   def captureLastExpression(global: Global)(trees: List[global.Tree]): List[global.Tree] = {
@@ -212,13 +224,13 @@ object ScalaInterpreter {
     val numTrees = trees.size
     trees.zipWithIndex.flatMap {
       case (tree, index) =>
-        val treeProgress = index.toDouble / numTrees
+        val treeProgress = Literal(Constant(index.toDouble / numTrees))
         val lineStr = s"Line ${tree.pos.line}"
         // code to notify kernel of progress in the cell
-        def setProgress(detail: String) = q"""kernel.setProgress($treeProgress, $detail)"""
+        def setProgress(detail: String) = q"""kernel.setProgress($treeProgress, ${Literal(Constant(detail))})"""
         def setPos(mark: Tree) =
           if(mark.pos.isRange)
-            Some(q"""kernel.setExecutionStatus(${mark.pos.start}, ${mark.pos.end})""")
+            Some(q"""kernel.setExecutionStatus(${Literal(Constant(mark.pos.start))}, ${Literal(Constant(mark.pos.end))})""")
           else None
 
         def wrapWithProgress(name: String, tree: Tree): List[Tree] =
@@ -235,7 +247,7 @@ object ScalaInterpreter {
 
   trait Factory extends Interpreter.Factory {
     val languageName = "Scala"
-    def apply(): TaskR[ScalaCompiler.Provider, ScalaInterpreter]
+    def apply(): RIO[Blocking with ScalaCompiler.Provider, ScalaInterpreter]
   }
 
   /**
@@ -243,6 +255,6 @@ object ScalaInterpreter {
     * because the JVM dependencies must already be fetched when the kernel is booted.
     */
   object Factory extends Factory {
-    override def apply(): TaskR[ScalaCompiler.Provider, ScalaInterpreter] = ScalaInterpreter()
+    override def apply(): RIO[Blocking with ScalaCompiler.Provider, ScalaInterpreter] = ScalaInterpreter()
   }
 }

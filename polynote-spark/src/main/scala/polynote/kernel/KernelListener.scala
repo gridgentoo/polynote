@@ -6,12 +6,12 @@ import java.util.function.{IntBinaryOperator, ToIntFunction}
 import scala.collection.JavaConverters._
 import org.apache.spark.scheduler.{JobFailed, JobSucceeded, SparkListener, SparkListenerJobEnd, SparkListenerJobStart, SparkListenerStageCompleted, SparkListenerStageSubmitted, SparkListenerTaskEnd, SparkListenerTaskStart, StageInfo}
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.thief.DAGSchedulerThief
+import polynote.kernel.logging.Logging
 import zio.blocking.Blocking
 import zio.clock.Clock
 import zio.{Runtime, UIO, ZIO}
 
-class KernelListener(taskManager: TaskManager.Service, session: SparkSession, runtime: Runtime[Blocking with Clock]) extends SparkListener {
+class KernelListener(taskManager: TaskManager.Service, session: SparkSession, runtime: Runtime[Blocking with Clock with Logging]) extends SparkListener {
 
   private val jobUpdaters = new ConcurrentHashMap[Int, (TaskInfo => TaskInfo) => Unit]()
   private val stageUpdaters = new ConcurrentHashMap[Int, (TaskInfo => TaskInfo) => Unit]()
@@ -58,25 +58,13 @@ class KernelListener(taskManager: TaskManager.Service, session: SparkSession, ru
     }
   }
 
-  private def cancelJob(jobId: Int): UIO[Unit] = ZIO.effectTotal {
-    DAGSchedulerThief(session).foreach {
-      scheduler => try {
-        scheduler.cancelJob(jobId)
-      } catch {
-        case err: Throwable => // TODO: log? We have to catch it, probably don't want to die here...
-      }
-    }
-  }
+  private def cancelJob(jobId: Int): ZIO[Logging, Nothing, Unit] = ZIO.effect {
+    session.sparkContext.cancelJob(jobId)
+  }.catchAll(Logging.error("Unable to cancel job", _))
 
-  private def cancelStage(stageId: Int): UIO[Unit] = ZIO.effectTotal {
-    DAGSchedulerThief(session).foreach {
-      scheduler => try {
-        scheduler.cancelStage(stageId)
-      } catch {
-        case err: Throwable =>
-      }
-    }
-  }
+  private def cancelStage(stageId: Int): ZIO[Logging, Nothing, Unit] = ZIO.effect {
+    session.sparkContext.cancelStage(stageId)
+  }.catchAll(Logging.error("Unable to cancel stage", _))
 
   private def sparkJobTaskId(jobId: Int) = s"SparkJob$jobId"
   private def sparkStageTaskId(stageId: Int) = s"SparkStage$stageId"
@@ -96,9 +84,10 @@ class KernelListener(taskManager: TaskManager.Service, session: SparkSession, ru
 
     jobStages.put(jobId, stageMap)
     jobTasksCompleted.put(jobId, new AtomicInteger(0))
+    val jobName = jobStart.stageInfos.headOption.map(_.name).getOrElse("")
 
     runtime.unsafeRun {
-      taskManager.register(sparkJobTaskId(jobId), label, "", TaskStatus.Complete) {
+      taskManager.register(sparkJobTaskId(jobId), label, jobName, None, Complete) {
         updater =>
           jobUpdaters.put(jobId, updater)
           cancelJob(jobId)
@@ -138,15 +127,19 @@ class KernelListener(taskManager: TaskManager.Service, session: SparkSession, ru
       allStages.put(stageId, stageInfo)
     }
 
+    val maybeJobId = Option(stageJobIds.get(stageId))
+
+    val parent = maybeJobId.map(jobId => sparkJobTaskId(jobId))
+
     runtime.unsafeRun {
-      taskManager.register(sparkStageTaskId(stageId), s"Stage $stageId", stageInfo.name, TaskStatus.Complete) {
+      taskManager.register(sparkStageTaskId(stageId), s"Stage $stageId", stageInfo.name, parent, Complete) {
         updater =>
           stageUpdaters.put(stageId, updater)
           cancelStage(stageId)
       }
     }
 
-    Option(stageJobIds.get(stageId)).foreach {
+    maybeJobId.foreach {
       jobId =>
         jobStages.get(jobId) match {
           case null =>
@@ -179,14 +172,29 @@ class KernelListener(taskManager: TaskManager.Service, session: SparkSession, ru
 
   override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = {
     import taskEnd.stageId
+    val jobId = stageJobIds.get(stageId)
     if (taskEnd.reason == org.apache.spark.Success) {
-      stageTasksCompleted.get(stageId) match {
+      val task = stageTasksCompleted.get(stageId) match {
         case null =>
           stageTasksCompleted.putIfAbsent(stageId, new AtomicInteger(0))
           stageTasksCompleted.get(stageId).incrementAndGet()
+          jobTasksCompleted.putIfAbsent(jobId, new AtomicInteger(0))
+          jobTasksCompleted.get(jobId).incrementAndGet()
+          0
         case ai => ai.incrementAndGet()
+          jobTasksCompleted.putIfAbsent(jobId, new AtomicInteger(0))
+          jobTasksCompleted.get(jobId).incrementAndGet()
       }
-      updateStageProgress(stageId)
+
+      val numTasks = allStages.get(stageId).numTasks
+      val increments = numTasks / 256
+      if (increments > 0) {
+        if (task % increments == 0) {
+          updateStageProgress(stageId)
+        }
+      } else {
+        updateStageProgress(stageId)
+      }
     }
   }
 

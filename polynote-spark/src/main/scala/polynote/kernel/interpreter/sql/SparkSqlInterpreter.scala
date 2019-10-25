@@ -9,7 +9,7 @@ import polynote.kernel.{BaseEnv, Completion, CompletionType, GlobalEnv, Interpre
 import polynote.kernel.interpreter.{Interpreter, State}
 import polynote.messages.{ShortString, TinyList}
 import polynote.runtime.spark.reprs.SparkReprsOf
-import zio.{Task, TaskR, ZIO}
+import zio.{Task, RIO, ZIO}
 import zio.blocking.effectBlocking
 
 import scala.collection.mutable
@@ -23,7 +23,7 @@ class SparkSqlInterpreter(compiler: ScalaCompiler) extends Interpreter {
   private val functions = new mutable.TreeSet[String]()
   private val tables = new mutable.HashMap[String, mutable.TreeSet[String]]()
 
-  def run(code: String, state: State): TaskR[InterpreterEnv, State] = {
+  def run(code: String, state: State): RIO[InterpreterEnv, State] = {
     parser.parse(state.id, code).fold(ZIO.fail, ZIO.succeed, (err, _) => ZIO.fail(err)).flatMap {
       parsed =>
         effectBlocking {
@@ -49,9 +49,9 @@ class SparkSqlInterpreter(compiler: ScalaCompiler) extends Interpreter {
   def completionsAt(code: String, pos: Int, state: State): Task[List[Completion]] = {
     def completeAtPos(statement: SingleStatementContext) = {
       val dfs = state.scope.collect {
-        case rv if rv.value.isInstanceOf[Dataset[_]] => rv.name
+        case rv if rv.value.isInstanceOf[Dataset[_]] => rv.name: String
       }
-      val results = statement.accept(new CompletionVisitor(pos, mutable.TreeSet(dfs: _*)))
+      val results = statement.accept(new CompletionVisitor(pos, mutable.TreeSet(dfs: _*) ++ tables.getOrElse(sessionCatalog.getCurrentDatabase, mutable.TreeSet.empty[String])))
       results
     }
 
@@ -60,24 +60,24 @@ class SparkSqlInterpreter(compiler: ScalaCompiler) extends Interpreter {
 
   def parametersAt(code: String, pos: Int, state: State): Task[Option[Signatures]] = ZIO.succeed(None)
 
-  private def loadCatalog(): Unit = {
-    val dbs = sessionCatalog.listDatabases()
-    dbs.foreach(databases.add)
-    dbs.foreach {
-      db =>
-        val tableSet = new mutable.TreeSet[String]()
-        tables.put(db, tableSet)
-        sessionCatalog.listTables(db) foreach {
-          table => tableSet.add(table.table)
-        }
-    }
 
-    sessionCatalog.listFunctions(sessionCatalog.getCurrentDatabase).foreach {
-      fn => functions.add(fn._1.funcName)
-    }
+  private def loadCatalog() = effectBlocking(sessionCatalog.listDatabases()).flatMap {
+    dbs => ZIO.sequencePar {
+      effectBlocking(sessionCatalog.listFunctions(sessionCatalog.getCurrentDatabase)).map {
+        fns => functions ++= fns.map(_._1.funcName)
+      } :: dbs.toList.map {
+        db => ZIO(databases.add(db)) *> effectBlocking {
+          val tableSet = new mutable.TreeSet[String]()
+          tables.put(db, tableSet)
+          sessionCatalog.listTables(db) foreach {
+            table => tableSet.add(table.table)
+          }
+        }
+      }
+    }.unit
   }
 
-  def init(state: State): TaskR[InterpreterEnv, State] = effectBlocking(loadCatalog()).fork.const(state)
+  def init(state: State): RIO[InterpreterEnv, State] = loadCatalog().fork.as(state)
 
   def shutdown(): Task[Unit] = ZIO.unit
 
@@ -122,13 +122,13 @@ class SparkSqlInterpreter(compiler: ScalaCompiler) extends Interpreter {
 }
 
 object SparkSqlInterpreter {
-  def apply(): TaskR[ScalaCompiler.Provider, SparkSqlInterpreter] = ZIO.access[ScalaCompiler.Provider](_.scalaCompiler).map {
+  def apply(): RIO[ScalaCompiler.Provider, SparkSqlInterpreter] = ZIO.access[ScalaCompiler.Provider](_.scalaCompiler).map {
     compiler => new SparkSqlInterpreter(compiler)
   }
 
   object Factory extends Interpreter.Factory {
     def languageName: String = "SQL"
-    def apply(): TaskR[BaseEnv with GlobalEnv with ScalaCompiler.Provider with CurrentNotebook with TaskManager, Interpreter] = SparkSqlInterpreter()
+    def apply(): RIO[BaseEnv with GlobalEnv with ScalaCompiler.Provider with CurrentNotebook with TaskManager, Interpreter] = SparkSqlInterpreter()
     override val requireSpark: Boolean = true
   }
 }

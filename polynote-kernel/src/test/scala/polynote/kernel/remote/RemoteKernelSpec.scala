@@ -1,28 +1,36 @@
-package polynote.kernel.remote
+package polynote.kernel
+package remote
+
+import java.util.concurrent.TimeUnit
 
 import org.scalamock.scalatest.MockFactory
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach, FreeSpec, Matchers}
+import org.scalatestplus.scalacheck.ScalaCheckDrivenPropertyChecks
 import polynote.kernel.Kernel.Factory
 import polynote.kernel.environment.{NotebookUpdates, PublishResult, PublishStatus}
-import polynote.kernel.{BaseEnv, CellEnv, Completion, CompletionType, GlobalEnv, Kernel, KernelBusyState, Output, ParameterHint, ParameterHints, ResultValue, Signatures, TaskInfo, UpdatedTasks}
+import polynote.kernel.{BaseEnv, CellEnv, Completion, CompletionType, GlobalEnv, Kernel, KernelBusyState, KernelInfo, Output, ParameterHint, ParameterHints, ResultValue, Signatures, TaskInfo, UpdatedTasks}
 import polynote.kernel.logging.Logging
 import polynote.messages._
 import polynote.runtime.ReprsOf.DataReprsOf
 import polynote.runtime.{DataEncoder, GroupAgg, MIMERepr, StreamingDataRepr, StringType}
-import polynote.testing.ZIOSpec
+import polynote.testing.{Generators, ZIOSpec}
 import polynote.testing.kernel.{MockEnv, MockKernelEnv}
 import polynote.testing.kernel.remote.InProcessDeploy
 import scodec.bits.ByteVector
-import zio.{Task, TaskR, ZIO}
+import zio.{RIO, Ref, Task, ZIO}
+import zio.interop.catz._
 
-class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAndAfterAll with BeforeAndAfterEach with MockFactory {
+import scala.concurrent.TimeoutException
+
+class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAndAfterAll with BeforeAndAfterEach with MockFactory with ScalaCheckDrivenPropertyChecks {
   private val kernel        = mock[Kernel]
-  private val kernelFactory = new Factory.Service {
-    def apply(): TaskR[BaseEnv with GlobalEnv with CellEnv with NotebookUpdates, Kernel] = ZIO.succeed(kernel)
+  private val kernelFactory = new Factory.LocalService {
+    def apply(): RIO[BaseEnv with GlobalEnv with CellEnv, Kernel] = ZIO.succeed(kernel)
   }
 
   private val env           = unsafeRun(MockKernelEnv(kernelFactory))
-  private val deploy        = new InProcessDeploy(kernelFactory)
+  private val clientRef     = unsafeRun(Ref.make[RemoteKernelClient](null))
+  private val deploy        = new InProcessDeploy(kernelFactory, clientRef)
   private val transport     = new SocketTransport(deploy, Some("127.0.0.1"))
   private val remoteKernel  = unsafeRun(RemoteKernel(transport).provide(env))
 
@@ -45,7 +53,7 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
 
       "queueCell" in {
         (kernel.queueCell _).expects(CellID(1)).returning {
-          PublishResult(Output("text/plain", "hello")).const(ZIO.unit)
+          PublishResult(Output("text/plain", "hello")).as(ZIO.unit)
         }
         unsafeRun(remoteKernel.queueCell(CellID(1)).provide(env).flatten)
         unsafeRun(env.publishResult.toList) shouldEqual List(Output("text/plain", "hello"))
@@ -67,6 +75,12 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
         val status = KernelBusyState(busy = false, alive = true)
         (kernel.status _).expects().returning(ZIO.succeed(status))
         unsafeRun(remoteKernel.status()) shouldEqual status
+      }
+
+      "info" in {
+        val info = KernelInfo("foo" -> "bar", "baz" -> "buzz")
+        (kernel.info _).expects().returning(ZIO.succeed(info))
+        unsafeRun(remoteKernel.info().provide(env)) shouldEqual info
       }
 
       "values" in {
@@ -97,6 +111,27 @@ class RemoteKernelSpec extends FreeSpec with Matchers with ZIOSpec with BeforeAn
       "releaseHandle" in {
         (kernel.releaseHandle _).expects(Streaming, 1).returning(ZIO.unit)
         unsafeRun(remoteKernel.releaseHandle(Streaming, 1).provide(env))
+      }
+
+      "handles notebook updates" in {
+        forAll((Generators.genNotebookUpdates _).tupled(unsafeRun(env.currentNotebook.get)), MinSize(4)) {
+          case (finalNotebook, updates) =>
+            whenever(updates.nonEmpty) {
+              val finalVersion = updates.last.globalVersion
+              updates.foreach {
+                update => unsafeRun(env.updateTopic.publish1(Some(update)))
+              }
+
+              val (remoteVersion, remoteNotebook) = unsafeRun {
+                clientRef.get.absorb.flatMap {
+                  client => client.notebookRef.discrete.terminateAfter(_._1 == finalVersion).compile[Task, Task, (Int, Notebook)].lastOrError
+                }.timeoutFail(new TimeoutException("timed out waiting for the correct notebook"))(zio.duration.Duration(2, TimeUnit.SECONDS))
+              }
+              remoteNotebook shouldEqual finalNotebook
+            }
+
+            unsafeRun(clientRef.get.flatMap(_.notebookRef.set(unsafeRun(env.currentNotebook.get))))
+        }
       }
 
       "shutdown" in {

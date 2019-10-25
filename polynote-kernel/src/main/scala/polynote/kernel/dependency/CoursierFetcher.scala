@@ -30,42 +30,21 @@ import polynote.kernel.environment.{CurrentNotebook, CurrentTask, Env}
 import polynote.kernel.util.{DownloadableFile, DownloadableFileProvider}
 import polynote.messages.NotebookConfig
 import zio.blocking.{Blocking, effectBlocking, blocking}
-import zio.{Task, TaskR, ZIO, ZManaged}
+import zio.{Task, RIO, ZIO, ZManaged}
 import zio.interop.catz._
 
 import scala.concurrent.ExecutionContext
 import scala.tools.nsc.interpreter.InputStream
 
 object CoursierFetcher {
-  type ArtifactTask[A] = TaskR[CurrentTask, A]
-  type OuterTask[A] = TaskR[TaskManager, A]
-  //type ArtifactTask[A] = TaskR[CurrentTask, A]
-
-  // TODO: should factor out the "sub-task" thing into a general-purpose concept. It would help with UI treatment too.
-  trait ParentTask {
-    def newSubtask(): Task[Unit]
-    def completedSubtask(): Task[Unit]
-  }
-
-  // Rotate the current task to be the parent task
-  def parentTask: TaskR[CurrentTask, ParentTask] = CurrentTask.access.map {
-    ref => new ParentTask {
-      private val totalTasks = new AtomicInteger(0)
-      private val completedTasks = new AtomicInteger(0)
-      override def newSubtask(): Task[Unit] = ZIO.effectTotal(totalTasks.incrementAndGet()).unit
-      override def completedSubtask(): Task[Unit] = for {
-        completed <- ZIO.effectTotal(completedTasks.incrementAndGet())
-        total     <- ZIO.effectTotal(totalTasks.get())
-        progress   = if (total == 0) 0.0 else completed.toDouble / total
-        _         <- ref.update(_.progress(progress))
-      } yield ()
-    }
-  }
+  type ArtifactTask[A] = RIO[CurrentTask, A]
+  type OuterTask[A] = RIO[TaskManager with CurrentTask, A]
+  //type ArtifactTask[A] = RIO[CurrentTask, A]
 
   private val excludedOrgs = Set(Organization("org.scala-lang"), Organization("org.apache.spark"))
   private val cache = FileCache[ArtifactTask]()
 
-  def fetch(language: String): TaskR[CurrentNotebook with TaskManager with Blocking, List[(String, File)]] = TaskManager.run("Coursier", "Dependencies", "Resolving dependencies") {
+  def fetch(language: String): RIO[CurrentNotebook with TaskManager with Blocking, List[(Boolean, String, File)]] = TaskManager.run("Coursier", "Dependencies", "Resolving dependencies") {
     for {
       config       <- CurrentNotebook.config
       dependencies  = config.dependencies.flatMap(_.toMap.get(language)).map(_.toList).getOrElse(Nil)
@@ -75,9 +54,8 @@ object CoursierFetcher {
       repositories <- ZIO.fromEither(repositories(repoConfigs))
       resolution   <- resolution(deps, exclusions, repositories)
       _            <- CurrentTask.update(_.copy(detail = "Downloading dependencies...", progress = 0))
-      downloadEnv  <- Env.enrichM[TaskManager with CurrentTask with Blocking](parentTask)
-      downloadDeps <- download(resolution).provide(downloadEnv).fork
-      downloadUris <- downloadUris(uris).provide(downloadEnv).fork
+      downloadDeps <- download(resolution).fork
+      downloadUris <- downloadUris(uris).fork
       downloaded   <- downloadDeps.join.map2(downloadUris.join)(_ ++ _)
     } yield downloaded
   }
@@ -100,7 +78,7 @@ object CoursierFetcher {
     dependencies: List[String],
     exclusions: List[String],
     repositories: List[Repository]
-  ): TaskR[CurrentTask, Resolution] = {
+  ): RIO[CurrentTask, Resolution] = ZIO {
     val coursierExclude = exclusions.map { exclusionStr =>
       exclusionStr.split(":") match {
         case Array(org, name) => (Organization(org), ModuleName(name))
@@ -108,7 +86,7 @@ object CoursierFetcher {
       }
     }.toSet ++ excludedOrgs.map(_ -> Exclusions.allNames)
 
-    val coursierDeps = dependencies.map {
+    lazy val coursierDeps = dependencies.map {
       moduleStr =>
         val (org, name, typ, config, classifier, ver) = moduleStr.split(':') match {
           case Array(org, name, ver) => (Organization(org), ModuleName(name), Type.empty, Configuration.default, Classifier.empty, ver)
@@ -124,7 +102,7 @@ object CoursierFetcher {
           .withTransitive(classifier.value != "all")
     }
 
-    val rootModules = coursierDeps.map(_.module).toSet
+    lazy val rootModules = coursierDeps.map(_.module).toSet
 
     // need to do some magic on the default repositories, because the sax parser for maven poms don't work
     val mavenRepository = classOf[MavenRepository]
@@ -164,9 +142,11 @@ object CoursierFetcher {
     def countingFetcher(fetcher: ResolutionProcess.Fetch[ArtifactTask]): ResolutionProcess.Fetch[ArtifactTask] = {
       modules: Seq[(Module, String)] =>
         addMoreModules(modules.size) *> fetcher(modules).flatMap {
-          md => resolveModules(md.size).const(md)
+          md => resolveModules(md.size).as(md)
         }
     }
+
+
 
     Resolve(cache)
       .addDependencies(coursierDeps: _*)
@@ -175,43 +155,41 @@ object CoursierFetcher {
       .transformFetcher(countingFetcher)
       .io
       .catchAll(recover)
-  }
+  }.flatten  // this is pretty lazy, it's just so we can throw an exception in the main block.
 
   private def download(
     resolution: Resolution,
     maxIterations: Int = 100
-  ): TaskR[TaskManager with ParentTask, List[(String, File)]] = ZIO.runtime[Any].flatMap {
+  ): RIO[TaskManager with CurrentTask, List[(Boolean, String, File)]] = ZIO.runtime[Any].flatMap {
     runtime =>
-      ZIO.access[ParentTask](identity).flatMap {
-        parentTask =>
-          Artifacts(new TaskManagedCache(cache, parentTask, runtime.Platform.executor.asEC)).withResolution(resolution).withMainArtifacts(true).io.map {
-            artifacts => artifacts.toList.map {
-              case (artifact, file) => artifact.url -> file
-            }
+      Artifacts(new TaskManagedCache(cache, runtime.Platform.executor.asEC)).withResolution(resolution).withMainArtifacts(true).ioResult.map {
+        artifactResult =>
+          artifactResult.detailedArtifacts.toList.map {
+            case (dep, pub, artifact, file) =>
+              (resolution.rootDependencies.contains(dep), artifact.url, file)
           }
       }
   }
 
-  private def downloadUris(uris: List[URI]): TaskR[TaskManager with CurrentTask with ParentTask with Blocking, List[(String, File)]] = {
+  private def downloadUris(uris: List[URI]): RIO[TaskManager with CurrentTask with Blocking, List[(Boolean, String, File)]] = {
     ZIO.collectAllPar {
       uris.map {
         uri => for {
-          task     <- ZIO.access[ParentTask](identity)
-          _        <- task.newSubtask()
-          download <- TaskManager.runR[Blocking with CurrentTask with TaskManager](uri.toString, uri.toString){
-            fetchUrl(uri, cacheLocation(uri).toFile).ensuring(task.completedSubtask().orDie)
+          download <- TaskManager.runSubtask(uri.toString, uri.toString){
+            fetchUrl(uri, cacheLocation(uri).toFile)
           }
-        } yield uri.toString -> download
+        } yield (true, uri.toString, download)
       }
     }
   }
 
-  protected def fetchUrl(uri: URI, localFile: File, chunkSize: Int = 8192): TaskR[Blocking with CurrentTask, File] = {
+  protected def fetchUrl(uri: URI, localFile: File, chunkSize: Int = 8192): RIO[Blocking with CurrentTask, File] = {
     def downloadToFile(file: DownloadableFile, cacheFile: File) = for {
       blockingEnv <- ZIO.access[Blocking](identity)
       task        <- CurrentTask.access
       ec          <- blockingEnv.blocking.blockingExecutor.map(_.asEC)
       size        <- blocking(LiftIO[Task].liftIO(file.size))
+      _           <- ZIO(Files.createDirectories(cacheFile.toPath.getParent))
       _           <- ZManaged.fromAutoCloseable(effectBlocking(new FileOutputStream(cacheFile))).use {
         os =>
           val fs2IS = fs2.io.readInputStream[Task](effectBlocking(file.openStream.unsafeRunSync()).provide(blockingEnv), chunkSize, ec)
@@ -219,7 +197,7 @@ object CoursierFetcher {
           fs2IS.chunks
             .mapAccumulate(0)((n, c) => (n + c.size, c))
             .evalMap {
-              case (i, chunk) => task.update(_.progress(i.toDouble / size)).const(chunk)
+              case (i, chunk) => task.update(_.progress(i.toDouble / size)).as(chunk)
             }
             .flatMap(fs2.Stream.chunk)
             .through(fs2OS)
@@ -233,7 +211,7 @@ object CoursierFetcher {
       file        <- ZIO.fromOption(DownloadableFileProvider.getFile(uri)).mapError(_ => new Exception(s"Unable to find provider for uri $uri"))
       inputAsFile  = Paths.get(uri.getPath).toFile
       exists      <- effectBlocking(inputAsFile.exists())
-      download    <- if (exists) ZIO.succeed(inputAsFile) else downloadToFile(file, localFile).const(localFile)
+      download    <- if (exists) ZIO.succeed(inputAsFile) else downloadToFile(file, localFile).as(localFile)
     } yield download
 
   }
@@ -260,15 +238,15 @@ object CoursierFetcher {
   }
 
   // coursier doesn't have instances for ZIO built in
-  implicit def zioSync[R]: Sync[TaskR[R, ?]] = new Sync[TaskR[R, ?]] {
-    def delay[A](a: => A): TaskR[R, A] = ZIO.effect(a)
-    def handle[A](a: TaskR[R, A])(f: PartialFunction[Throwable, A]): TaskR[R, A] = a.catchSome(f andThen ZIO.succeed)
-    def fromAttempt[A](a: Either[Throwable, A]): TaskR[R, A] = ZIO.fromEither(a)
-    def gather[A](elems: Seq[TaskR[R, A]]): TaskR[R, Seq[A]] = Traverse[List].sequence[TaskR[R, ?], A](elems.toList)
-    def point[A](a: A): TaskR[R, A] = ZIO.succeed(a)
-    def bind[A, B](elem: TaskR[R, A])(f: A => TaskR[R, B]): TaskR[R, B] = elem.flatMap(f)
+  implicit def zioSync[R]: Sync[RIO[R, ?]] = new Sync[RIO[R, ?]] {
+    def delay[A](a: => A): RIO[R, A] = ZIO.effect(a)
+    def handle[A](a: RIO[R, A])(f: PartialFunction[Throwable, A]): RIO[R, A] = a.catchSome(f andThen ZIO.succeed)
+    def fromAttempt[A](a: Either[Throwable, A]): RIO[R, A] = ZIO.fromEither(a)
+    def gather[A](elems: Seq[RIO[R, A]]): RIO[R, Seq[A]] = Traverse[List].sequence[RIO[R, ?], A](elems.toList)
+    def point[A](a: A): RIO[R, A] = ZIO.succeed(a)
+    def bind[A, B](elem: RIO[R, A])(f: A => RIO[R, B]): RIO[R, B] = elem.flatMap(f)
 
-    def schedule[A](pool: ExecutorService)(f: => A): TaskR[R, A] = ZIO.effect(f).on {
+    def schedule[A](pool: ExecutorService)(f: => A): RIO[R, A] = ZIO.effect(f).on {
       pool match {
         case pool: ExecutionContext => pool
         case pool => ExecutionContext.fromExecutorService(pool)
@@ -279,19 +257,19 @@ object CoursierFetcher {
   /**
     * Wraps an underlying [[FileCache]] such that each cache task is managed by the TaskManager
     */
-  class TaskManagedCache(underlying: FileCache[ArtifactTask], parentTask: ParentTask, val ec: ExecutionContext) extends Cache[OuterTask] {
-    def fetch: Artifact => EitherT[OuterTask, String, String] = {
+  class TaskManagedCache(underlying: FileCache[ArtifactTask], val ec: ExecutionContext) extends Cache[OuterTask] {
+    override def fetch: Artifact => EitherT[OuterTask, String, String] = {
       artifact =>
         val name = taskName(artifact.url)
-        EitherT(TaskManager.run(name, name, artifact.url)(logged(_.fetch(artifact).run)))
+        EitherT(TaskManager.runSubtask(name, name, artifact.url)(logged(_.fetch(artifact).run)))
     }
 
-    def file(artifact: Artifact): EitherT[OuterTask, ArtifactError, File] = {
+    override def file(artifact: Artifact): EitherT[OuterTask, ArtifactError, File] = {
       val name = taskName(artifact.url)
-      EitherT(TaskManager.run(name, name, artifact.url)(logged(_.file(artifact).run)))
+      EitherT(TaskManager.runSubtask(name, name, artifact.url)(logged(_.file(artifact).run)))
     }
 
-    def logged[A](fn: FileCache[ArtifactTask] => ArtifactTask[A]): TaskR[CurrentTask, A] = for {
+    def logged[A](fn: FileCache[ArtifactTask] => ArtifactTask[A]): RIO[CurrentTask, A] = for {
       logger <- TaskManagedCache.logger
       result <- fn(underlying.withLogger(logger))
     } yield result

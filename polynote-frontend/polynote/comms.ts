@@ -13,14 +13,20 @@ type ListenerCallback = (...args: any[]) => void
 export type MessageListener = [typeof Message, ListenerCallback, boolean?];
 
 export class SocketSession extends EventTarget {
-    static current: SocketSession; // gross!
+    private static inst: SocketSession;
+
+    static get get() {
+        if (!SocketSession.inst) {
+            SocketSession.inst = new SocketSession()
+        }
+        return SocketSession.inst
+    }
 
     socket: WebSocket;
     listeners: any;
 
-    constructor(public queue: Message[] = [], public messageListeners: MessageListener[] = []) {
+    private constructor(public queue: Message[] = [], public messageListeners: MessageListener[] = []) {
         super();
-        SocketSession.current = this; // yeah...
         this.mkSocket();
     }
 

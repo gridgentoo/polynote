@@ -1,7 +1,24 @@
 'use strict';
 
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api'
-import {UIEvent, UIEventTarget} from '../util/ui_event'
+import {
+    CancelTasks,
+    CreateNotebook,
+    TriggerItem,
+    UIMessageTarget,
+    ImportNotebook,
+    UIToggle,
+    TabActivated,
+    NoActiveTab,
+    ViewAbout,
+    DownloadNotebook,
+    ClearOutput,
+    UIMessageRequest,
+    ServerVersion,
+    RunningKernels,
+    KernelCommand,
+    LoadNotebook, CellsLoaded
+} from '../util/ui_event'
 import {Cell, CellContainer, CodeCell, CodeCellModel} from "./cell"
 import {div, span, TagElement} from '../util/tags'
 import * as messages from '../../data/messages';
@@ -18,8 +35,7 @@ import {NotebookListUI} from "./notebook_list";
 import {HomeUI} from "./home";
 import {Either} from "../../data/types";
 import {SocketSession} from "../../comms";
-import {NotebookCellsUI} from "./nb_cells";
-import {ImportNotebook} from "../util/ui_events";
+import {CurrentNotebook} from "./current_notebook";
 
 // what is this?
 document.execCommand("defaultParagraphSeparator", false, "p");
@@ -27,7 +43,7 @@ document.execCommand("styleWithCSS", false);
 
 export const Interpreters: Record<string, string> = {};
 
-export class MainUI extends UIEventTarget {
+export class MainUI extends UIMessageTarget {
     private mainView: SplitView;
     readonly toolbarUI: ToolbarUI;
     readonly el: TagElement<"div">;
@@ -37,46 +53,49 @@ export class MainUI extends UIEventTarget {
     private disabled: boolean;
     private currentServerCommit?: number;
     private currentServerVersion: number;
-    private currentNotebookPath: string;
-    private currentNotebook: NotebookCellsUI;
     private about?: About;
     private welcomeUI?: HomeUI;
 
-    // TODO: remove socket reference
-    constructor(public socket: SocketSession) {
+    constructor() {
         super();
         let left = { el: div(['grid-shell'], []) };
         let center = { el: div(['tab-view'], []) };
         let right = { el: div(['grid-shell'], []) };
 
         this.mainView = new SplitView('split-view', left, center, right);
-        this.toolbarUI = new ToolbarUI();
+        this.toolbarUI = new ToolbarUI().setParent(this);
 
         this.el = div(['main-ui'], [this.toolbarUI.el, this.mainView.el]);
 
         this.notebookContent = div(['notebook-content'], []);
 
-        this.tabUI = new TabUI({notebook: this.notebookContent, kernel: right.el});
+        this.tabUI = new TabUI({notebook: this.notebookContent, kernel: right.el}).setParent(this);
         this.mainView.center.el.appendChild(this.tabUI.el);
         this.mainView.center.el.appendChild(this.notebookContent);
 
-        this.browseUI = new NotebookListUI().setEventParent(this);
+        this.browseUI = new NotebookListUI().setParent(this);
         this.mainView.left.el.appendChild(this.browseUI.el);
-        this.addEventListener('TriggerItem', evt => {
+        this.subscribe(TriggerItem, item => {
             if (!this.disabled) {
-                this.loadNotebook(evt.detail.item);
+                this.loadNotebook(item);
             }
         });
         // TODO: remove listeners on children.
-        this.browseUI.addEventListener('NewNotebook', () => this.createNotebook());
-        this.browseUI.addEventListener('ImportNotebook', evt => this.importNotebook(evt));
-        this.browseUI.addEventListener('ToggleNotebookListUI', (evt) => this.mainView.collapse('left', evt.detail && evt.detail.force));
+        this.subscribe(CreateNotebook, () => this.createNotebook());
+        this.subscribe(ImportNotebook, (name, content) => this.importNotebook(name, content));
+        this.subscribe(UIToggle, (which, force) => {
+            if (which === "NotebookList") {
+                this.mainView.collapse('left', force)
+            } else if (which === "KernelUI") {
+                this.mainView.collapse('right', force)
+            }
+        });
         this.browseUI.init();
 
-        socket.listenOnceFor(messages.ListNotebooks, (items) => this.browseUI.setItems(items));
-        socket.send(new messages.ListNotebooks([]));
+        SocketSession.get.listenOnceFor(messages.ListNotebooks, (items) => this.browseUI.setItems(items));
+        SocketSession.get.send(new messages.ListNotebooks([]));
 
-        socket.listenOnceFor(messages.ServerHandshake, (interpreters, serverVersion, serverCommit) => {
+        SocketSession.get.listenOnceFor(messages.ServerHandshake, (interpreters, serverVersion, serverCommit) => {
             for (let interp of Object.keys(interpreters)) {
                 Interpreters[interp] = interpreters[interp];
             }
@@ -94,13 +113,13 @@ export class MainUI extends UIEventTarget {
             this.currentServerCommit = serverCommit;
         });
 
-        socket.addEventListener('close', evt => {
+        SocketSession.get.addEventListener('close', evt => {
            this.browseUI.setDisabled(true);
            this.toolbarUI.setDisabled(true);
            this.disabled = true;
         });
 
-        socket.addEventListener('open', evt => {
+        SocketSession.get.addEventListener('open', evt => {
            this.browseUI.setDisabled(false);
            this.toolbarUI.setDisabled(false);
            this.disabled = false;
@@ -112,30 +131,29 @@ export class MainUI extends UIEventTarget {
            }
         });
 
-        this.tabUI.addEventListener('TabActivated', evt => {
-            const tab = evt.detail.tab;
-            if (tab.type === 'notebook') {
-                const tabPath = `/notebook/${tab.name}`;
+        this.subscribe(TabActivated, (name, type) => {
+            if (type === 'notebook') {
+                const tabPath = `/notebook/${name}`;
 
                 const href = window.location.href;
                 const hash = window.location.hash;
-                const title = `${tab.name.split(/\//g).pop()} | Polynote`;
+                const title = `${name.split(/\//g).pop()} | Polynote`;
                 document.title = title; // looks like chrome ignores history title so we need to be explicit here.
 
                  // handle hashes and ensure scrolling works
                 if (hash && window.location.pathname === tabPath) {
-                    window.history.pushState({notebook: tab.name}, title, href);
+                    window.history.pushState({notebook: name}, title, href);
                     this.handleHashChange()
                 } else {
-                    window.history.pushState({notebook: tab.name}, title, tabPath);
+                    window.history.pushState({notebook: name}, title, tabPath);
                 }
 
-                this.currentNotebookPath = tab.name;
-                this.currentNotebook = this.tabUI.getTab(tab.name).content.notebook.cellsUI; // TODO: remove cellsUI reference
-                this.currentNotebook.notebookUI.cellUI.forceLayout(evt)
-            } else if (tab.type === 'home') {
+                const currentNotebook = this.tabUI.getTab(name).content.notebook.cellsUI;
+                CurrentNotebook.set(currentNotebook.notebookUI);
+                currentNotebook.notebookUI.cellUI.forceLayout()
+            } else if (type === 'home') {
                 const title = 'Polynote';
-                window.history.pushState({notebook: tab.name}, title, '/');
+                window.history.pushState({notebook: name}, title, '/');
                 document.title = title
             }
         });
@@ -144,163 +162,55 @@ export class MainUI extends UIEventTarget {
             this.handleHashChange()
         });
 
-        // TODO: we probably shouldn't be adding listeners on our children like this
-        this.tabUI.addEventListener('NoActiveTab', () => {
+        this.subscribe(NoActiveTab, () => {
             this.showWelcome();
         });
 
-        this.toolbarUI.addEventListener('RunAll', (evt) => {
-            if (this.currentNotebook) {
-                evt.forward(this.currentNotebook);
-            }
+        this.subscribe(CancelTasks, path => {
+           SocketSession.get.send(new messages.CancelTasks(path));
         });
 
-        this.toolbarUI.addEventListener('RunToCursor', (evt) => {
-            if (this.currentNotebook) {
-                evt.forward(this.currentNotebook);
-            }
-        });
-
-        this.toolbarUI.addEventListener('RunCurrentCell', (evt) => {
-            if (this.currentNotebook) {
-                evt.forward(this.currentNotebook);
-            }
-        });
-
-        this.toolbarUI.addEventListener('CancelTasks', () => {
-           this.socket.send(new messages.CancelTasks(this.currentNotebookPath));
-        });
-
-        this.toolbarUI.addEventListener('Undo', () => {
-           const notebookUI = this.currentNotebook.notebookUI;
-           if (notebookUI instanceof NotebookUI) {
-               notebookUI // TODO: implement undoing after deciding on behavior
-           }
-        });
-
-
-        // TODO: Can we get rid of Cell.currentFocus and instead put the cell ID in the event itself?
-        // TODO: Do we need InsertAbove / InsertBelow if we already have InsertCellAfter / InsertCellBefore?
-        // TODO: shares a lot of logic with InsertBelow
-        this.toolbarUI.addEventListener('InsertAbove', () => {
-            const cellsUI = this.currentNotebook;
-            let activeCell = Cell.currentFocus || cellsUI.firstCell();
-            const activeCellId = activeCell.id;
-            if (!cellsUI.getCell(activeCellId) || cellsUI.getCell(activeCellId) !== activeCell) {
-                console.log("Active cell is not part of current notebook?");
-                return;
-            }
-
-            cellsUI.dispatchEvent(new UIEvent('InsertCellBefore', { cellId: activeCellId }));
-        });
-
-        this.toolbarUI.addEventListener('InsertBelow', () => {
-            const cellsUI = this.currentNotebook;
-            let activeCell = Cell.currentFocus || cellsUI.firstCell();
-            const activeCellId = activeCell.id;
-            if (!cellsUI.getCell(activeCellId) || cellsUI.getCell(activeCellId) !== activeCell) {
-                console.log("Active cell is not part of current notebook?");
-                return;
-            }
-
-            cellsUI.dispatchEvent(new UIEvent('InsertCellAfter', { cellId: activeCellId }));
-        });
-
-        this.toolbarUI.addEventListener('DeleteCell', () => {
-            const cellsUI = this.currentNotebook;
-            const activeCell = Cell.currentFocus;
-            if (activeCell) {
-                const activeCellId = activeCell.id;
-                if (!cellsUI.getCell(activeCellId) || cellsUI.getCell(activeCellId) !== Cell.currentFocus) {
-                    console.log("Active cell is not part of current notebook?");
-                    return;
-                }
-                cellsUI.dispatchEvent(new UIEvent('DeleteCell', {cellId: activeCellId }));
-            } else {
-                console.log("No active cell!");
-            }
-        });
-
-        this.toolbarUI.addEventListener('ViewAbout', (evt) => {
+        this.subscribe(ViewAbout, section => {
             if (!this.about) {
-                this.about = new About().setEventParent(this);
+                this.about = new About().setParent(this);
             }
-            this.about.show(evt.detail.section);
+            this.about.show(section);
         });
 
-        this.toolbarUI.addEventListener('DownloadNotebook', () => {
-            MainUI.browserDownload(window.location.pathname + "?download=true", this.currentNotebook.path);
+        this.subscribe(DownloadNotebook, path => {
+            MainUI.browserDownload(window.location.pathname + "?download=true", path);
         });
 
-        this.toolbarUI.addEventListener('ClearOutput', () => {
-            this.socket.send(new messages.ClearOutput(this.currentNotebookPath))
+        this.subscribe(ClearOutput, path => {
+            SocketSession.get.send(new messages.ClearOutput(path))
         });
 
-        // START new listeners TODO: remove this comment once everything's cleaned up
-
-        this.respond('ServerVersion', evt => {
-            evt.detail.callback(this.currentServerVersion, this.currentServerCommit);
-        });
-
-        this.respond('RunningKernels', evt => {
-            this.socket.request(new messages.RunningKernels([])).then((msg) => {
-                evt.detail.callback(msg.kernelStatuses)
-            })
-        });
-
-        // TODO: consolidate all start kernel requests to this function
-        this.addEventListener('StartKernel', evt => {
-            this.socket.send(new messages.StartKernel(evt.detail.path, messages.StartKernel.NoRestart));
-        });
-
-        // TODO: consolidate all kill kernel requests to this function
-        this.addEventListener('KillKernel', evt => {
-            if (confirm("Kill running kernel? State will be lost.")) {
-                this.socket.send(new messages.StartKernel(evt.detail.path, messages.StartKernel.Kill));
+        this.subscribe(UIMessageRequest, (msg, cb) => {
+            if (msg.prototype === ServerVersion.prototype)  {
+                cb(this.currentServerVersion, this.currentServerCommit)
+            } else if (msg.prototype === RunningKernels.prototype) {
+                SocketSession.get.request(new messages.RunningKernels([])).then((msg) => {
+                    cb(msg.kernelStatuses)
+                })
             }
         });
 
-        this.addEventListener('LoadNotebook', evt => this.loadNotebook(evt.detail.path));
-
-        this.addEventListener('Connect', () => {
-            if (this.socket.isClosed) {
-                this.socket.reconnect(true);
+        this.subscribe(KernelCommand, (path, command) => {
+            if (command === "start") {
+                SocketSession.get.send(new messages.StartKernel(path, messages.StartKernel.NoRestart));
+            } else if (command === "kill") {
+                if (confirm("Kill running kernel? State will be lost.")) {
+                    SocketSession.get.send(new messages.StartKernel(path, messages.StartKernel.Kill));
+                }
             }
         });
 
-        // socket message handlers
-        this.handleEventListenerRegistration('KernelStatus', evt => {
-            this.socket.addMessageListener(messages.KernelStatus, (path, update) => {
-                evt.detail.callback(path, update)
-            });
-        });
-
-        this.handleEventListenerRegistration('SocketClosed', evt => {
-            this.socket.addEventListener('close', _ => {
-                evt.detail.callback()
-            });
-        });
-
-        this.handleEventListenerRegistration('KernelError', evt => {
-            this.socket.addMessageListener(messages.Error, (code, err) => {
-                evt.detail.callback(code, err)
-            });
-        });
-
-        this.handleEventListenerRegistration('CellResult', evt => {
-           this.socket.addMessageListener(messages.CellResult, () => {
-               evt.detail.callback();
-           }, evt.detail.once);
-        });
-
-        this.handleEventListenerRegistration('resize', evt => {
-            window.addEventListener('resize', () => evt.detail.callback())
-        })
+        this.subscribe(LoadNotebook, path => this.loadNotebook(path));
     }
 
     showWelcome() {
         if (!this.welcomeUI) {
-            this.welcomeUI = new HomeUI().setEventParent(this);
+            this.welcomeUI = new HomeUI().setParent(this);
         }
         const welcomeKernelUI = new KernelUI(this, '/', /*showInfo*/ false, /*showSymbols*/ false, /*showTasks*/ true, /*showStatus*/ false);
         this.tabUI.addTab('home', span([], 'Home'), {
@@ -313,25 +223,13 @@ export class MainUI extends UIEventTarget {
         const notebookTab = this.tabUI.getTab(path);
 
         if (!notebookTab) {
-            const notebookUI = new NotebookUI(this, path, this.socket, this);
-            this.socket.send(new messages.LoadNotebook(path));
+            const notebookUI = new NotebookUI(this, path, this); // TODO: remove these `this`
+            SocketSession.get.send(new messages.LoadNotebook(path));
             const tab = this.tabUI.addTab(path, span(['notebook-tab-title'], [path.split(/\//g).pop()!]), {
                 notebook: notebookUI.cellUI.el,
                 kernel: notebookUI.kernelUI.el
             }, 'notebook');
             this.tabUI.activateTab(tab);
-
-            this.toolbarUI.cellToolbar.cellTypeSelector.addEventListener('change', (evt: any) => { // event types are so annoying. this is probably fine... TODO: a proper type eventually.
-                // hacky way to tell whether this is the current notebook ...
-                if (this.currentNotebook.notebookUI === notebookUI) {
-                    notebookUI.onCellLanguageSelected(evt.target.value, path);
-                }
-            });
-
-            notebookUI.kernelUI.addEventListener('ToggleKernelUI', (evt) => {
-                this.mainView.collapse('right', evt.detail && evt.detail.force)
-            });
-
         } else {
             this.tabUI.activateTab(notebookTab);
         }
@@ -349,27 +247,27 @@ export class MainUI extends UIEventTarget {
     }
 
     createNotebook() {
-        const handler = this.socket.addMessageListener(messages.CreateNotebook, (actualPath) => {
-            this.socket.removeMessageListener(handler);
+        const handler = SocketSession.get.addMessageListener(messages.CreateNotebook, (actualPath) => {
+            SocketSession.get.removeMessageListener(handler);
             this.browseUI.addItem(actualPath);
             this.loadNotebook(actualPath);
         });
 
         const notebookPath = prompt("Enter the name of the new notebook (no need for an extension)");
         if (notebookPath) {
-            this.socket.send(new messages.CreateNotebook(notebookPath))
+            SocketSession.get.send(new messages.CreateNotebook(notebookPath))
         }
     }
 
-    importNotebook(evt: ImportNotebook) {
-        const handler = this.socket.addMessageListener(messages.CreateNotebook, (actualPath) => {
-            this.socket.removeMessageListener(handler);
+    importNotebook(name?: string, content?: string) {
+        const handler = SocketSession.get.addMessageListener(messages.CreateNotebook, (actualPath) => {
+            SocketSession.get.removeMessageListener(handler);
             this.browseUI.addItem(actualPath);
             this.loadNotebook(actualPath);
         });
 
-        if (evt.detail && evt.detail.name) { // the evt has all we need
-            this.socket.send(new messages.CreateNotebook(evt.detail.name, Either.right(evt.detail.content)));
+        if (name && content) { // the evt has all we need
+            SocketSession.get.send(new messages.CreateNotebook(name, Either.right(content)));
         } else {
             const userInput = prompt("Enter the full URL of another Polynote instance.");
             const notebookURL = userInput && new URL(userInput);
@@ -378,13 +276,13 @@ export class MainUI extends UIEventTarget {
                 const nbFile = decodeURI(notebookURL.pathname.split("/").pop()!);
                 notebookURL.search = "download=true";
                 notebookURL.hash = "";
-                this.socket.send(new messages.CreateNotebook(nbFile, Either.left(notebookURL.href)));
+                SocketSession.get.send(new messages.CreateNotebook(nbFile, Either.left(notebookURL.href)));
             }
         }
     }
 
     handleHashChange() {
-        this.addEventListener('CellsLoaded', evt => {
+        this.subscribe(CellsLoaded, () => {
             const hash = document.location.hash;
             // the hash can (potentially) have two parts: the selected cell and selected lines.
             // for example: #Cell2,6-12 would mean Cell2 lines 6-12

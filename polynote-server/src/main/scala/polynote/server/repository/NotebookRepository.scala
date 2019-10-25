@@ -9,7 +9,6 @@ import cats.syntax.functor._
 import io.circe.Printer
 import org.http4s.client.blaze._
 import polynote.config.PolynoteConfig
-import polynote.kernel.util.OptionEither
 import polynote.messages._
 import polynote.server.repository.ipynb.ZeppelinNotebook
 
@@ -18,16 +17,37 @@ import scala.concurrent.ExecutionContext
 
 trait NotebookRepository[F[_]] {
 
+  /**
+    * @return Whether a notebook exists at the specified path
+    */
   def notebookExists(path: String): F[Boolean]
 
+  /**
+    * @return The notebook at the specified path
+    */
   def loadNotebook(path: String): F[Notebook]
 
+  /**
+    * Save the given notebook to the specified path
+    */
   def saveNotebook(path: String, cells: Notebook): F[Unit]
 
+  /**
+    * @return A list of notebook paths that exist in this repository
+    */
   def listNotebooks(): F[List[String]]
 
   // TODO: imports shouldn't happen on the server anymore... second arg should be Option[Notebook]
-  def createNotebook(path: String, maybeUriOrContent: OptionEither[String, String]): F[String]
+  /**
+    * Create a notebook at the given path, optionally importing from the given URI (on the left) or the given content
+    * string (on the right).
+    */
+  def createNotebook(path: String, maybeUriOrContent: Option[Either[String, String]]): F[String]
+
+  /**
+    * Initialize the storage for this repository (i.e. create directory if it doesn't exist)
+    */
+  def initStorage(): F[Unit]
 }
 
 abstract class FileBasedRepository[F[_]](implicit F: ConcurrentEffect[F], contextShift: ContextShift[F]) extends NotebookRepository[F] {
@@ -101,7 +121,7 @@ abstract class FileBasedRepository[F[_]](implicit F: ConcurrentEffect[F], contex
     Some(NotebookConfig.fromPolynoteConfig(config))
   )
 
-  def createNotebook(relativePath: String, maybeUriOrContent: OptionEither[String, String] = OptionEither.Neither): F[String] = {
+  def createNotebook(relativePath: String, maybeUriOrContent: Option[Either[String, String]] = None): F[String] = {
     val ext = s".$defaultExtension"
     val noExtPath = relativePath.replaceFirst("""^/+""", "").stripSuffix(ext)
 
@@ -110,35 +130,39 @@ abstract class FileBasedRepository[F[_]](implicit F: ConcurrentEffect[F], contex
     } else {
       findUniqueName(noExtPath, ext).flatMap { name =>
         val extPath = name + ext
-        maybeUriOrContent.fold(
-          uri => {
+        val createOrImport = maybeUriOrContent match {
+          case None =>
+            val defaultTitle = name.split('/').last.replaceAll("[\\s\\-_]+", " ").trim()
+            saveNotebook(extPath, emptyNotebook(extPath, defaultTitle))
+          case Some(Left(uri)) =>
             BlazeClientBuilder[F](executionContext).resource.use { client =>
               client.expect[String](uri)
             }.flatMap { content =>
               writeString(extPath, content)
             }
-          },
-          content => {
+          case Some(Right(content)) =>
             if (relativePath.endsWith(".json")) { // assume zeppelin
               import io.circe.parser.parse
               import io.circe.syntax._
               for {
                 parsed <- F.fromEither(parse(content))
-                zep <- F.fromEither(parsed.as[ZeppelinNotebook])
-                jup = zep.toJupyterNotebook
-                jupStr = Printer.spaces2.copy(dropNullValues = true).pretty(jup.asJson)
-                io <- writeString(extPath, jupStr)
+                  zep <- F.fromEither(parsed.as[ZeppelinNotebook])
+                  jup = zep.toJupyterNotebook
+                  jupStr = Printer.spaces2.copy(dropNullValues = true).pretty(jup.asJson)
+                  io <- writeString(extPath, jupStr)
               } yield io
             } else {
               writeString(extPath, content)
             }
-          },
-          {
-            val defaultTitle = name.split('/').last.replaceAll("[\\s\\-_]+", " ").trim()
-            saveNotebook(extPath, emptyNotebook(extPath, defaultTitle))
-          }
-        ) map (_ => extPath)
+        }
+        createOrImport.map(_ => extPath)
       }
+    }
+  }
+
+  def initStorage(): F[Unit] = F.delay {
+    if (!Files.exists(path)) {
+      Files.createDirectories(path)
     }
   }
 }

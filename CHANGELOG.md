@@ -1,6 +1,75 @@
-# UNRELEASED
+# UNRELEASED 
 
-*
+* 
+
+# 0.2.7 (October 23, 2019)
+
+* Cross build for Scala 2.12
+* Support for LaTeX MIME type output
+* Fix some race conditions in Scala compiler
+* Fix issue with nondeterministic queueing order
+* Fix bug when notebook folder doesn't exist (Polynote now creates a notebook directory for you)
+* Fix an issue where failed dependency downloads could cause notebook to be unresponsive until a restart
+
+
+# 0.2.6 (October 18, 2019)
+
+* Fix regression causing missing ExecutionInfo
+* Fix regression causing the python interpreter shutdown to crash the kernel
+* Fix regression causing symbol table to be stale after page reload
+* Fix regression causing inserted cells not to be focused
+* Remove spellcheck on code cells that would sometimes come up
+* Always add a StringRepr. 
+* Some minor cleanup of UI events
+* Update fonts to address a bug in Firefox (https://bugzilla.mozilla.org/show_bug.cgi?id=1589156)
+* Add some initial docs (more to come!)
+* Update the logo (slightly)
+
+# 0.2.5 (October 14, 2019)
+
+* Subtasks!
+  * Now related tasks are properly grouped together as parent and child tasks for less UI clutter
+* Matplotlib backend
+  * A proper Polynote backend for Matplotlib! Only supports regular old plotting, no interactive or animation support (for now)
+* Finally added a license :) 
+* Fix some bugs that were slowing down some Spark jobs. 
+* Fix some bugs with Python-Scala interop
+* Fix some more data encoding bugs
+
+# 0.2.4 (October 10, 2019)
+
+* Fix some bugs with data encoding
+* Surface some error messages better in the UI
+* Improve completions
+* Add rudimentary auto-importing, kinda
+
+# 0.2.3 (October 8, 2019)
+
+* Better output display for some types
+* Two new quick link buttons to go straight to the plot and data inspectors
+* Fix race condition leading to the 'double typing issue'
+* Fix some data encoding bugs
+* Improvements and fixes to plot editor
+* Better nullability handling across the board. 
+* Fixes for some remote kernel sync issues
+* Various bugfixes
+
+# 0.2.2 (October 3, 2019)
+
+* Fix bug setting spark output path
+* Fix bug preventing download of dependencies
+* Fix more completion bugs
+* Fix more classloader bugs
+* Fix more remote kernel bugs
+
+# 0.2.1 (October 1, 2019)
+
+* Fix cell queuing order bug
+* add map types to schema view
+* fix spark executors ui error
+* fix remote kernel crash
+* fix some bugs in Configuration UI
+* fix case where some completions weren't working
 
 # 0.2.0 (September 27, 2019)
 

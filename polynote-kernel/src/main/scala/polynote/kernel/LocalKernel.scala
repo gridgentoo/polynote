@@ -14,12 +14,13 @@ import polynote.kernel.environment.{Config, CurrentNotebook, CurrentRuntime, Cur
 import polynote.kernel.interpreter.State.Root
 import polynote.kernel.interpreter.{Interpreter, State}
 import polynote.kernel.interpreter.scal.ScalaInterpreter
+import polynote.kernel.logging.Logging
 import polynote.kernel.util.RefMap
 import polynote.messages.{ByteVector32, CellID, HandleType, Lazy, NotebookCell, Streaming, Updating, truncateTinyString}
-import polynote.runtime.{LazyDataRepr, ReprsOf, StreamingDataRepr, StringRepr, TableOp, UpdatingDataRepr}
+import polynote.runtime.{LazyDataRepr, ReprsOf, StreamingDataRepr, StringRepr, TableOp, UpdatingDataRepr, ValueRepr}
 import scodec.bits.ByteVector
-import zio.{Task, TaskR, ZIO}
-import zio.blocking.Blocking
+import zio.{Task, RIO, ZIO}
+import zio.blocking.{Blocking, effectBlocking}
 import zio.clock.Clock
 import zio.interop.catz._
 
@@ -33,40 +34,45 @@ class LocalKernel private[kernel] (
 
   import compilerProvider.scalaCompiler
 
-  override def queueCell(id: CellID): TaskR[BaseEnv with GlobalEnv with CellEnv, Task[Unit]] =
-    TaskManager.queue(s"Cell $id", s"Cell $id", errorWith = TaskStatus.Complete) {
+  def currentTime: ZIO[Clock, Nothing, Long] = ZIO.accessM[Clock](_.clock.currentTime(TimeUnit.MILLISECONDS))
 
-      val run = for {
-        _             <- busyState.update(_.setBusy)
-        notebookRef   <- CurrentNotebook.access
-        notebook      <- notebookRef.get
-        cell          <- ZIO(notebook.cell(id))
-        interpEnv     <- InterpreterEnvironment.fromKernel(id)
-        interpreter   <- getOrLaunch(cell.language, CellID(0)).provideSomeM(Env.enrich[BaseEnv with GlobalEnv with CellEnv](interpEnv: InterpreterEnv))
-        state         <- interpreterState.get
-        prevCells      = notebook.cells.takeWhile(_.id != cell.id)                                                    // find the latest executed state that correlates to a notebook cell
-        prevState      = prevCells.reverse.map(_.id).flatMap(state.at).headOption.getOrElse(latestPredef(state))
-        _             <- PublishResult(ClearResults())
-        clock         <- ZIO.access[Clock](_.clock)                                                                   // time the execution and notify clients of timing
-        start         <- clock.currentTime(TimeUnit.MILLISECONDS)
-        _             <- PublishResult(ExecutionInfo(start, None)).provide(interpEnv)
-        initialState   = State.id(id, prevState)                                                                      // run the cell while capturing outputs
-        resultState   <- (interpreter.run(cell.content.toString, initialState) >>= updateValues)
-          .onTermination(_ => CurrentRuntime.access.flatMap(rt => ZIO.effectTotal(rt.clearExecutionStatus())))
-          .provideSomeM(interpEnv.mkExecutor(scalaCompiler.classLoader))
-        end           <- clock.currentTime(TimeUnit.MILLISECONDS)                                                     // finish timing and notify clients of elapsed time
-        _             <- PublishResult(ExecutionInfo(start, Some(end))).provide(interpEnv)
-        _             <- updateState(resultState) //interpreterState.update(_.insertOrReplace(resultState))
-        _             <- resultState.values.map(PublishResult.apply).sequence.unit                                    // publish the result values
-        _             <- busyState.update(_.setIdle)
-      } yield ()
+  override def queueCell(id: CellID): RIO[BaseEnv with GlobalEnv with CellEnv, Task[Unit]] =
+    TaskManager.queue(s"Cell $id", s"Cell $id", errorWith = _ => _.completed) {
+      currentTime.flatMap {
+        startTime =>
+          def publishEndTime: RIO[PublishResult with Clock, Unit] =
+            currentTime.flatMap(endTime => PublishResult(ExecutionInfo(startTime, Some(endTime))))
 
-      run.supervised.onInterrupt {
-        PublishResult(ErrorResult(new InterruptedException("Execution was interrupted by the user"))).orDie *>
-        busyState.update(_.setIdle).orDie
-      }.catchAll {
-        err =>
-          PublishResult(ErrorResult(err)) *> busyState.update(_.setIdle)
+          val run = for {
+            _             <- busyState.update(_.setBusy)
+            notebook      <- CurrentNotebook.get
+            cell          <- ZIO(notebook.cell(id))
+            interpEnv     <- InterpreterEnvironment.fromKernel(id)
+            interpreter   <- getOrLaunch(cell.language, CellID(0)).provideSomeM(Env.enrich[BaseEnv with GlobalEnv with CellEnv](interpEnv: InterpreterEnv))
+            state         <- interpreterState.get
+            prevCells      = notebook.cells.takeWhile(_.id != cell.id)                                                  // find the latest executed state that correlates to a notebook cell
+            prevState      = prevCells.reverse.map(_.id).flatMap(state.at).headOption.getOrElse(latestPredef(state))
+            _             <- PublishResult(ClearResults())
+            _             <- PublishResult(ExecutionInfo(startTime, None))
+            _             <- CurrentNotebook.get
+            initialState   = State.id(id, prevState)                                                                    // run the cell while capturing outputs
+            resultState   <- (interpreter.run(cell.content.toString, initialState) >>= updateValues)
+              .ensuring(CurrentRuntime.access.flatMap(rt => ZIO.effectTotal(rt.clearExecutionStatus())))
+              .provideSomeM(Env.enrichM[Logging](interpEnv.mkExecutor(scalaCompiler.classLoader).widen[InterpreterEnv]))
+            _             <- publishEndTime
+            _             <- updateState(resultState)
+            _             <- resultState.values.map(PublishResult.apply).sequence.unit                                  // publish the result values
+            _             <- busyState.update(_.setIdle)
+          } yield ()
+
+          run.supervised.onInterrupt {
+            PublishResult(ErrorResult(new InterruptedException("Execution was interrupted by the user"))).orDie *>
+            busyState.update(_.setIdle).orDie *>
+            publishEndTime.orDie
+          }.catchAll {
+            err =>
+              PublishResult(ErrorResult(err)) *> busyState.update(_.setIdle) *> publishEndTime.orDie
+          }
       }
     }
 
@@ -84,21 +90,21 @@ class LocalKernel private[kernel] (
     }
   }
 
-  override def completionsAt(id: CellID, pos: Int): TaskR[BaseEnv with GlobalEnv with CellEnv, List[Completion]] = {
+  override def completionsAt(id: CellID, pos: Int): RIO[BaseEnv with GlobalEnv with CellEnv, List[Completion]] = {
     for {
       (cell, interp, state) <- cellInterpreter(id, forceStart = true)
       completions           <- interp.completionsAt(cell.content.toString, pos, state)
     } yield completions
   }.catchAll(_ => ZIO.succeed(Nil))
 
-  override def parametersAt(id: CellID, pos: Int): TaskR[BaseEnv with GlobalEnv with CellEnv, Option[Signatures]] = {
+  override def parametersAt(id: CellID, pos: Int): RIO[BaseEnv with GlobalEnv with CellEnv, Option[Signatures]] = {
     for {
       (cell, interp, state) <- cellInterpreter(id, forceStart = true)
       signatures            <- interp.parametersAt(cell.content.toString, pos, state).mapError(_ => ())
     } yield signatures
   }.catchAll(_ => ZIO.succeed(None))
 
-  override def init(): TaskR[BaseEnv with GlobalEnv with CellEnv, Unit] = TaskManager.run("Predef", "Predef") {
+  override def init(): RIO[BaseEnv with GlobalEnv with CellEnv, Unit] = TaskManager.run("Predef", "Predef") {
     for {
       publishStatus <- PublishStatus.access
       busyUpdater   <- busyState.discrete.terminateAfter(!_.alive).through(publishStatus.publish).compile.drain.fork
@@ -109,7 +115,7 @@ class LocalKernel private[kernel] (
   }
 
 
-  override def getHandleData(handleType: HandleType, handleId: Int, count: Int): TaskR[BaseEnv with StreamingHandles, Array[ByteVector32]] =
+  override def getHandleData(handleType: HandleType, handleId: Int, count: Int): RIO[BaseEnv with StreamingHandles, Array[ByteVector32]] =
     handleType match {
       case Lazy =>
         for {
@@ -125,16 +131,16 @@ class LocalKernel private[kernel] (
       case Streaming => StreamingHandles.getStreamData(handleId, count)
     }
 
-  override def modifyStream(handleId: Int, ops: List[TableOp]): TaskR[BaseEnv with StreamingHandles, Option[StreamingDataRepr]] =
+  override def modifyStream(handleId: Int, ops: List[TableOp]): RIO[BaseEnv with StreamingHandles, Option[StreamingDataRepr]] =
     StreamingHandles.modifyStream(handleId, ops)
 
-  override def releaseHandle(handleType: HandleType, handleId: Int): TaskR[BaseEnv with StreamingHandles, Unit] = handleType match {
+  override def releaseHandle(handleType: HandleType, handleId: Int): RIO[BaseEnv with StreamingHandles, Unit] = handleType match {
     case Lazy => ZIO(LazyDataRepr.releaseHandle(handleId))
     case Updating => ZIO(UpdatingDataRepr.releaseHandle(handleId))
     case Streaming => StreamingHandles.releaseStreamHandle(handleId)
   }
 
-  private def initScala(): TaskR[BaseEnv with GlobalEnv with CellEnv with CurrentTask, State] = for {
+  private def initScala(): RIO[BaseEnv with GlobalEnv with CellEnv with CurrentTask, State] = for {
     scalaInterp   <- interpreters.get("scala").orDie.get.mapError(_ => new IllegalStateException("No scala interpreter"))
     initialState  <- interpreterState.get
     predefEnv     <- InterpreterEnvironment.fromKernel(initialState.id)
@@ -164,7 +170,7 @@ class LocalKernel private[kernel] (
       cell        <- CurrentNotebook.getCell(id)
       state       <- interpreterState.get.orDie
       prevCells    = notebook.cells.takeWhile(_.id != cell.id)
-      prevState    = prevCells.reverse.map(_.id).flatMap(state.at).headOption.getOrElse(State.Root)
+      prevState    = prevCells.reverse.map(_.id).flatMap(state.at).headOption.getOrElse(latestPredef(state))
       interpreter <-
         if (forceStart)
           getOrLaunch(cell.language, id).provideSomeM(Env.enrichM[BaseEnv with GlobalEnv with CellEnv](
@@ -176,7 +182,7 @@ class LocalKernel private[kernel] (
     result => Option(result)
   }.catchAll(_ => ZIO.succeed(None)).get  // TODO: need a real OptionT
 
-  private def getOrLaunch(language: String, at: CellID): TaskR[BaseEnv with GlobalEnv with InterpreterEnv with CurrentNotebook with TaskManager with Interpreter.Factories with Config, Interpreter] =
+  private def getOrLaunch(language: String, at: CellID): RIO[BaseEnv with GlobalEnv with InterpreterEnv with CurrentNotebook with TaskManager with Interpreter.Factories with Config, Interpreter] =
     interpreters.getOrCreate(language) {
       Interpreter.availableFactories(language)
         .flatMap(facs => chooseInterpreterFactory(facs).mapError(_ => new UnsupportedOperationException(s"No available interpreter for $language")))
@@ -200,41 +206,52 @@ class LocalKernel private[kernel] (
   /**
     * Finds reprs of each value in the state, and returns a new state with the values updated to include the reprs
     */
-  private def updateValues(state: State): TaskR[Blocking, State] = {
+  private def updateValues(state: State): RIO[Blocking with Logging, State] = {
     import scalaCompiler.global, global.{appliedType, typeOf}
     val (names, types) = state.values.map {v =>
       v.name -> appliedType(typeOf[ReprsOf[Any]].typeConstructor, v.scalaType.asInstanceOf[global.Type])
     }.toMap.toList.unzip
-    scalaCompiler.inferImplicits(types).map {
+    scalaCompiler.inferImplicits(types).flatMap {
       instances =>
         val instanceMap = names.zip(instances).collect {
           case (name, Some(instance)) => name -> instance.asInstanceOf[ReprsOf[Any]]
         }.toMap
 
-        def updateValue(value: ResultValue): ResultValue = {
+        def updateValue(value: ResultValue): RIO[Blocking with Logging, ResultValue] = {
+          def stringRepr = StringRepr(truncateTinyString(Option(value.value).flatMap(v => Option(v.toString)).getOrElse("null")))
           if (value.value != null) {
-            val reprs = instanceMap.get(value.name).toList.flatMap(_.apply(value.value).toList) match {
-              case reprs if reprs.exists(_.isInstanceOf[StringRepr]) => reprs
-              case reprs => reprs :+ StringRepr(truncateTinyString(Option(value.value).flatMap(v => Option(v.toString)).getOrElse("null")))
+            ZIO.effectTotal(instanceMap.get(value.name)).flatMap {
+              case Some(instance) =>
+                effectBlocking(instance.apply(value.value))
+                  .onError(err => Logging.error("Error creating result reprs", err))
+                  .catchAll(_ => ZIO.succeed(Array.empty[ValueRepr])).map(_.toList).map {
+                    case reprs if reprs.exists(_.isInstanceOf[StringRepr]) => reprs
+                    case reprs => reprs :+ stringRepr
+                  }.map {
+                    reprs => value.copy(reprs = reprs)
+                  }
+
+              case None =>
+                ZIO.succeed(value.copy(reprs = List(stringRepr)))
             }
-            value.copy(reprs = reprs)
-          } else value
+          } else ZIO.succeed(value.copy(reprs = List(stringRepr)))
         }
 
-        state.updateValues(updateValue)
+        state.updateValuesM(updateValue)
     }
 
   }
 }
 
-class LocalKernelFactory extends Kernel.Factory.Service {
+class LocalKernelFactory extends Kernel.Factory.LocalService {
 
-  def apply(): TaskR[BaseEnv with GlobalEnv with CellEnv, Kernel] = for {
+  def apply(): RIO[BaseEnv with GlobalEnv with CellEnv, Kernel] = for {
     scalaDeps    <- CoursierFetcher.fetch("scala")
-    compiler     <- ScalaCompiler.provider(scalaDeps.map(_._2))
+    (main, transitive) = scalaDeps.partition(_._1)
+    compiler     <- ScalaCompiler.provider(main.map(_._3), transitive.map(_._3))
     busyState    <- SignallingRef[Task, KernelBusyState](KernelBusyState(busy = true, alive = true))
     interpreters <- RefMap.empty[String, Interpreter]
-    _            <- interpreters.getOrCreate("scala")(ScalaInterpreter().provide(compiler))
+    _            <- interpreters.getOrCreate("scala")(ScalaInterpreter().provideSomeM(Env.enrich[Blocking](compiler)))
     interpState  <- Ref[Task].of[State](State.predef(State.Root, State.Root))
   } yield new LocalKernel(compiler, interpState, interpreters, busyState)
 

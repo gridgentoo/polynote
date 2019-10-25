@@ -7,7 +7,7 @@ import cats.effect.concurrent.Ref
 import cats.syntax.traverse._
 import cats.instances.list._
 import zio.interop.catz._
-import zio.{Semaphore, Task, TaskR, UIO, ZIO}
+import zio.{Semaphore, Task, RIO, UIO, ZIO}
 
 
 /**
@@ -18,30 +18,27 @@ class RefMap[K, V] private (
   semaphore: Semaphore
 ) {
 
-  def getOrCreate[E](key: K)(create: => TaskR[E, V]): TaskR[E, V] = synchronized {
+  def getOrCreate[E](key: K)(create: => RIO[E, V]): RIO[E, V] = synchronized {
     if (underlying.containsKey(key)) {
       ZIO.succeed(underlying.get(key)).flatMap(_.get)
     } else {
       semaphore.withPermit {
-        if (underlying.containsKey(key)) {
-          ZIO.succeed(underlying.get(key)).flatMap(_.get)
-        } else {
-          create.tap(v => Ref[Task].of(v).flatMap(ref =>
-            ZIO(underlying.put(key, ref))))
+        ZIO(underlying.containsKey(key)).flatMap {
+          case true => ZIO.succeed(underlying.get(key)).flatMap(_.get)
+          case false => create.tap(v => Ref[Task].of(v).flatMap(ref => ZIO(underlying.put(key, ref))))
         }
       }
     }
   }
 
-  def getOrCreateRef[E](key: K)(create: TaskR[E, Ref[Task, V]]): TaskR[E, V] = synchronized {
+  def getOrCreateRef[E](key: K)(create: RIO[E, Ref[Task, V]]): RIO[E, V] = synchronized {
     if (underlying.containsKey(key)) {
       ZIO.succeed(underlying.get(key)).flatMap(_.get)
     } else {
       semaphore.withPermit {
-        if (underlying.containsKey(key)) {
-          ZIO.succeed(underlying.get(key)).flatMap(_.get)
-        } else {
-          create.tap(ref => ZIO(underlying.put(key, ref))).flatMap(_.get)
+        ZIO(underlying.containsKey(key)).flatMap {
+          case true => ZIO.succeed(underlying.get(key)).flatMap(_.get)
+          case false => create.tap(ref => ZIO(underlying.put(key, ref))).flatMap(_.get)
         }
       }
     }

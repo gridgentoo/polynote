@@ -5,44 +5,30 @@ import {div, button, TagElement} from "../util/tags";
 import {ResultValue} from "../../data/result";
 import {MIMERepr, DataRepr, LazyDataRepr, StreamingDataRepr, StringRepr} from "../../data/value_repr";
 import match from "../../util/match";
-import {displayContent, displayData, contentTypeName} from "./display_content"
-import {ArrayType, DataType, StructType} from "../../data/data_type";
+import {displayContent, displayData, contentTypeName, displaySchema} from "./display_content"
+import {ArrayType, DataType, MapType, StructType} from "../../data/data_type";
 import {PlotEditor} from "./plot_editor";
 import {TableView} from "./table_view";
 import {TabNav} from "./tab_nav";
 import {DataReader} from "../../data/codec";
 
-function schemaToObject(structType: StructType) {
-    const obj: Record<string, any> = {};
-    for (let field of structType.fields) {
-        const [name, desc] = dataTypeToObjectField(field.name, field.dataType);
-        obj[name] = desc;
+
+export class ValueInspector extends FullScreenModal {
+    private static inst: ValueInspector;
+    static get() {
+        if (!ValueInspector.inst) {
+            ValueInspector.inst = new ValueInspector();
+        }
+        return ValueInspector.inst;
     }
-    return obj;
-}
-
-function dataTypeToObjectField(name: string, dataType: DataType): [string, any] {
-    if (dataType instanceof StructType) {
-        return [name, schemaToObject(dataType)];
-    } else if (dataType instanceof ArrayType) {
-        return [`${name}[]`, dataTypeToObjectField('element', dataType.element)[1]];
-    } else {
-        return [name, (dataType.constructor as typeof DataType).typeName(dataType)];
-    }
-}
-
-class ValueInspector extends FullScreenModal {
-
     constructor() {
         super(
             div([], []),
             { windowClasses: ['value-inspector'] }
         );
-
-        this.addEventListener('InsertCellAfter', evt => this.hide());
     }
 
-    inspect(resultValue: ResultValue, notebookPath: string) {
+    inspect(resultValue: ResultValue, notebookPath: string, jumpTo?: string) {
         this.content.innerHTML = "";
         let tabsPromise = Promise.resolve({} as Record<string, TagElement<any>>);
 
@@ -54,12 +40,21 @@ class ValueInspector extends FullScreenModal {
                     .when(DataRepr, (dataType, data) => {
                         tabs[`Data(${resultValue.typeName})`] = displayData(dataType.decodeBuffer(new DataReader(data)))
                     })
+                    .when(LazyDataRepr, (handle, dataType, knownSize) => {
+                        const tabName = `Data(${resultValue.typeName})`;
+                        if (!tabs[tabName]) {
+                            // TODO: a UI for downloading & viewing the data anyway.
+                            tabs[tabName] = div(['lazy-data'], [
+                                `The data was too large to transmit (${knownSize ? knownSize + " bytes" : 'unknown size'}), so it can't be displayed here.`
+                            ]);
+                        }
+                    })
                     .when(StreamingDataRepr, (handle, dataType, knownSize) => {
                         const repr = new StreamingDataRepr(handle, dataType, knownSize);
                         if (dataType instanceof StructType) {
-                            tabs['Schema'] = div(['schema-display'], [displayData(schemaToObject(dataType), undefined, true)]);
+                            tabs['Schema'] = displaySchema(dataType);
                             try {
-                                tabs['Plot data'] = new PlotEditor(repr, notebookPath, resultValue.name, resultValue.sourceCell).setEventParent(this).container;
+                                tabs['Plot data'] = new PlotEditor(repr, notebookPath, resultValue.name, resultValue.sourceCell, () => this.hide()).container;
                                 tabs['View data'] = new TableView(repr, notebookPath).el;
                             } catch(err) {
                                 console.log(err);
@@ -72,7 +67,11 @@ class ValueInspector extends FullScreenModal {
 
         return tabsPromise.then(tabs => {
             if (Object.keys(tabs).length) {
-                this.content.appendChild(new TabNav(tabs).el);
+                const nav = new TabNav(tabs);
+                if (jumpTo && tabs[jumpTo]) {
+                    nav.showItem(jumpTo);
+                }
+                this.content.appendChild(nav.el);
                 this.setTitle(`Inspect: ${resultValue.name}`);
                 this.show();
             }
@@ -80,5 +79,3 @@ class ValueInspector extends FullScreenModal {
     }
 
 }
-
-export const valueInspector = new ValueInspector();

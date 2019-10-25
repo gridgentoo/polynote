@@ -8,7 +8,7 @@ import org.scalatest.{FreeSpec, Matchers}
 import polynote.kernel.{Output, Result, ResultValue, ScalaCompiler, TaskInfo}
 import polynote.testing.{InterpreterSpec, ValueMap, ZIOSpec}
 import polynote.messages.CellID
-import zio.{TaskR, ZIO}
+import zio.{RIO, ZIO}
 import zio.blocking.Blocking
 import zio.clock.Clock
 import zio.console.Console
@@ -23,8 +23,9 @@ import scala.tools.nsc.Settings
 
 class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
 
-  val interpreter: ScalaInterpreter = ScalaInterpreter().provide(new ScalaCompiler.Provider {
+  val interpreter: ScalaInterpreter = ScalaInterpreter().provide(new ScalaCompiler.Provider with Blocking {
     val scalaCompiler: ScalaCompiler = compiler
+    override val blocking: Blocking.Service[Any] = ScalaInterpreterSpec.this.Environment.blocking
   }).runIO()
   import interpreter.ScalaCellState
 
@@ -142,6 +143,19 @@ class ScalaInterpreterSpec extends FreeSpec with Matchers with InterpreterSpec {
   }
 
   "cases from previous scala interpreter" - {
+    "allow values to be overridden" in {
+      val code = Seq(
+        "val a: Int = 100",
+        "val a: Int = 200",
+        "val b = a"
+      )
+      assertOutput(code) {
+        case (vars, output) =>
+          vars("a") shouldEqual 200
+          vars("b") shouldEqual 200
+      }
+    }
+
     "be able to display html using the kernel runtime reference" in {
       val code = """kernel.display.html("hi")"""
       assertOutput(code) {

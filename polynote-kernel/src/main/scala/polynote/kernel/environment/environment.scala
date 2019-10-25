@@ -2,6 +2,7 @@ package polynote.kernel.environment
 
 import cats.effect.concurrent.Ref
 import fs2.Stream
+import fs2.concurrent.SignallingRef
 import polynote.config.PolynoteConfig
 import polynote.env.ops.Enrich
 import polynote.kernel.interpreter.CellExecutor
@@ -12,7 +13,7 @@ import polynote.runtime.KernelRuntime
 import zio.blocking.Blocking
 import zio.internal.Executor
 import zio.interop.catz._
-import zio.{Task, TaskR, UIO, ZIO}
+import zio.{Task, RIO, UIO, ZIO}
 
 //////////////////////////////////////////////////////////////////////
 // Environment modules to mix for various layers of the application //
@@ -26,7 +27,7 @@ trait Config {
 }
 
 object Config {
-  def access: TaskR[Config, PolynoteConfig] = ZIO.access[Config](_.polynoteConfig)
+  def access: RIO[Config, PolynoteConfig] = ZIO.access[Config](_.polynoteConfig)
   def of(config: PolynoteConfig): Config = new Config {
     val polynoteConfig: PolynoteConfig = config
   }
@@ -40,8 +41,8 @@ trait PublishStatus {
 }
 
 object PublishStatus {
-  def access: TaskR[PublishStatus, Publish[Task, KernelStatusUpdate]] = ZIO.access[PublishStatus](_.publishStatus)
-  def apply(statusUpdate: KernelStatusUpdate): TaskR[PublishStatus, Unit] =
+  def access: RIO[PublishStatus, Publish[Task, KernelStatusUpdate]] = ZIO.access[PublishStatus](_.publishStatus)
+  def apply(statusUpdate: KernelStatusUpdate): RIO[PublishStatus, Unit] =
     ZIO.accessM[PublishStatus](_.publishStatus.publish1(statusUpdate))
 }
 
@@ -53,11 +54,11 @@ trait PublishResult {
 }
 
 object PublishResult {
-  def access: TaskR[PublishResult, Publish[Task, Result]] = ZIO.access[PublishResult](_.publishResult)
-  def apply(result: Result): TaskR[PublishResult, Unit] =
+  def access: RIO[PublishResult, Publish[Task, Result]] = ZIO.access[PublishResult](_.publishResult)
+  def apply(result: Result): RIO[PublishResult, Unit] =
     ZIO.accessM[PublishResult](_.publishResult.publish1(result))
 
-  def apply(results: List[Result]): TaskR[PublishResult, Unit] =
+  def apply(results: List[Result]): RIO[PublishResult, Unit] =
     access.flatMap {
       pr => Stream.emits(results).through(pr.publish).compile.drain
     }
@@ -71,8 +72,8 @@ trait PublishMessage {
 }
 
 object PublishMessage {
-  def access: TaskR[PublishMessage, Publish[Task, Message]] = ZIO.access[PublishMessage](_.publishMessage)
-  def apply(message: Message): TaskR[PublishMessage, Unit] =
+  def access: RIO[PublishMessage, Publish[Task, Message]] = ZIO.access[PublishMessage](_.publishMessage)
+  def apply(message: Message): RIO[PublishMessage, Unit] =
     ZIO.accessM[PublishMessage](_.publishMessage.publish1(message))
 
   def of(publish: Publish[Task, Message]): PublishMessage = new PublishMessage {
@@ -88,9 +89,15 @@ trait CurrentTask {
 }
 
 object CurrentTask {
-  def access: TaskR[CurrentTask, Ref[Task, TaskInfo]] = ZIO.access[CurrentTask](_.currentTask)
-  def get: TaskR[CurrentTask, TaskInfo] = access.flatMap(_.get)
-  def update(fn: TaskInfo => TaskInfo): TaskR[CurrentTask, Unit] = access.flatMap(_.update(fn))
+  def access: RIO[CurrentTask, Ref[Task, TaskInfo]] = ZIO.access[CurrentTask](_.currentTask)
+  def get: RIO[CurrentTask, TaskInfo] = access.flatMap(_.get)
+
+  def update(fn: TaskInfo => TaskInfo): RIO[CurrentTask, Unit] = for {
+    ref   <- access
+    value <- ref.get
+    _     <- if (fn(value) != value) ref.update(fn) else ZIO.unit
+  } yield ()
+
   def of(ref: Ref[Task, TaskInfo]): CurrentTask = new CurrentTask {
     val currentTask: Ref[Task, TaskInfo] = ref
   }
@@ -134,7 +141,7 @@ object CurrentRuntime {
       }
   }
 
-  def from(cellID: CellID): TaskR[PublishResult with PublishStatus with CurrentTask, CurrentRuntime] =
+  def from(cellID: CellID): RIO[PublishResult with PublishStatus with CurrentTask, CurrentRuntime] =
     ((PublishResult.access, PublishStatus.access, CurrentTask.access)).map3(CurrentRuntime.from(cellID, _, _, _)).flatten
 
   def access: ZIO[CurrentRuntime, Nothing, KernelRuntime] = ZIO.access[CurrentRuntime](_.currentRuntime)
@@ -145,31 +152,22 @@ object CurrentRuntime {
   */
 // TODO: should separate out a read-only capability for interpreters (they have no business modifying the notebook)
 trait CurrentNotebook {
-  val currentNotebook: Ref[Task, Notebook]
+  val currentNotebook: Ref[Task, (Int, Notebook)]
 }
 
 object CurrentNotebook {
-  def of(ref: Ref[Task, Notebook]): CurrentNotebook = new CurrentNotebook {
-    val currentNotebook: Ref[Task, Notebook] = ref
+  def of(ref: Ref[Task, (Int, Notebook)]): CurrentNotebook = new CurrentNotebook {
+    val currentNotebook: Ref[Task, (Int, Notebook)] = ref
   }
 
-  def access: TaskR[CurrentNotebook, Ref[Task, Notebook]] = ZIO.access[CurrentNotebook](_.currentNotebook)
+  def get: RIO[CurrentNotebook, Notebook] = getVersioned.map(_._2)
+  def getVersioned: RIO[CurrentNotebook, (Int, Notebook)] = ZIO.accessM[CurrentNotebook](_.currentNotebook.get)
 
-  def get: TaskR[CurrentNotebook, Notebook] = ZIO.accessM[CurrentNotebook](_.currentNotebook.get)
-
-  def getCell(id: CellID): TaskR[CurrentNotebook, NotebookCell] = get.flatMap {
+  def getCell(id: CellID): RIO[CurrentNotebook, NotebookCell] = get.flatMap {
     notebook => ZIO.fromOption(notebook.getCell(id)).mapError(_ => new NoSuchElementException(s"No such cell $id in notebook ${notebook.path}"))
   }
 
-  def update(fn: Notebook => Notebook): TaskR[CurrentNotebook, Notebook] = ZIO.accessM[CurrentNotebook] {
-    cn => cn.currentNotebook.modify(notebook => fn(notebook) match { case nb => (nb, nb) })
-  }
-
-  def setResults(cellID: CellID, results: List[Result]): TaskR[CurrentNotebook, Unit] = access.flatMap {
-    ref => ref.update(_.setResults(cellID, results))
-  }
-
-  def config: TaskR[CurrentNotebook, NotebookConfig] = get.map(_.config.getOrElse(NotebookConfig.empty))
+  def config: RIO[CurrentNotebook, NotebookConfig] = get.map(_.config.getOrElse(NotebookConfig.empty))
 }
 
 /**
@@ -180,7 +178,7 @@ trait NotebookUpdates {
 }
 
 object NotebookUpdates {
-  def access: TaskR[NotebookUpdates, Stream[Task, NotebookUpdate]] = ZIO.access[NotebookUpdates](_.notebookUpdates)
+  def access: RIO[NotebookUpdates, Stream[Task, NotebookUpdate]] = ZIO.access[NotebookUpdates](_.notebookUpdates)
 }
 
 
@@ -222,12 +220,12 @@ object InterpreterEnvironment {
     case env => InterpreterEnvironment(env.blocking, env.publishResult, env.publishStatus, env.currentTask, env.currentRuntime)
   }
 
-  def fromKernel(cellID: CellID): TaskR[Blocking with CellEnv with CurrentTask, InterpreterEnvironment] = for {
+  def fromKernel(cellID: CellID): RIO[Blocking with CellEnv with CurrentTask, InterpreterEnvironment] = for {
     env            <- ZIO.access[Blocking with CellEnv with CurrentTask](identity)
     currentRuntime <- CurrentRuntime.from(cellID)
   } yield InterpreterEnvironment(env.blocking, env.publishResult, env.publishStatus, env.currentTask, currentRuntime.currentRuntime)
 
-  def noTask(cellID: CellID): TaskR[Blocking with CellEnv, InterpreterEnvironment] = for {
+  def noTask(cellID: CellID): RIO[Blocking with CellEnv, InterpreterEnvironment] = for {
     env            <- ZIO.access[Blocking with CellEnv](identity)
     taskRef        <- Ref[Task].of(TaskInfo("None"))
     currentRuntime <- CurrentRuntime.from(cellID, env.publishResult, env.publishStatus, taskRef)

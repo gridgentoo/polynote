@@ -1,13 +1,23 @@
 "use strict";
 
 import * as monaco from "monaco-editor";
-import {div, span, tag, TagElement} from "../util/tags";
+import * as katex from "katex";
+import {Content, details, div, span, tag, TagElement} from "../util/tags";
+import {ArrayType, DataType, MapType, OptionalType, StructField, StructType} from "../../data/data_type";
 
-export function displayContent(contentType: string, content: string, contentTypeArgs?: Record<string, string>): Promise<TagElement<any>> {
+export function displayContent(contentType: string, content: string | DocumentFragment, contentTypeArgs?: Record<string, string>): Promise<TagElement<any>> {
     const [mimeType, args] = contentTypeArgs ? [contentType, contentTypeArgs] : parseContentType(contentType);
 
     let result;
-    if (mimeType === "text/plain") {
+    if (mimeType === "text/html" || mimeType === "image/svg" || mimeType === "image/svg+xml" || content instanceof DocumentFragment) {
+        const node = div(['htmltext'], []);
+        if (content instanceof DocumentFragment) {
+            node.appendChild(content);
+        } else {
+            node.innerHTML = content;
+        }
+        result = Promise.resolve(node);
+    } else if (mimeType === "text/plain") {
         if (args.lang) {
             result = monaco.editor.colorize(content, args.lang, {}).then(html => {
                 const node = (span(['plaintext', 'colorized'], []) as TagElement<"span", HTMLSpanElement & {"data-lang": string}>).attr('data-lang', args.lang);
@@ -18,9 +28,9 @@ export function displayContent(contentType: string, content: string, contentType
             result = Promise.resolve(span(['plaintext'], [document.createTextNode(content)]));
         }
 
-    } else if (mimeType === "text/html" || mimeType === "image/svg" || mimeType === "image/svg+xml") {
-        const node = div(['htmltext'], []);
-        node.innerHTML = content;
+    } else if (mimeType === "application/x-latex" || mimeType === "application/latex") {
+        const node = div([], []);
+        katex.render(content, node, { displayMode: true, throwOnError: false });
         result = Promise.resolve(node);
     } else if (mimeType.startsWith("image/")) {
         const img = document.createElement('img');
@@ -74,7 +84,8 @@ export function truncate(string: any, len?: number) {
     return string;
 }
 
-export function displayData(data: any, fieldName?: string, expandObjects: boolean = false) {
+export function displayData(data: any, fieldName?: string, expandObjects: boolean | number = false) {
+    const expandNext: boolean | number = typeof(expandObjects) === "number" ? (expandObjects > 0 ? expandObjects - 1 : false) : expandObjects;
 
     function shortDisplay(data: any) {
         if (data instanceof Array) {
@@ -105,7 +116,7 @@ export function displayData(data: any, fieldName?: string, expandObjects: boolea
                 break;
             }
             count++;
-            elems.appendChild(tag('li', [], {}, displayData(elem, undefined, expandObjects)));
+            elems.appendChild(tag('li', [], {}, displayData(elem, undefined, expandNext)));
         }
         return details;
     } else if (data instanceof Map) {
@@ -120,7 +131,7 @@ export function displayData(data: any, fieldName?: string, expandObjects: boolea
         const details = tag('details', ['object-display'], expandObjects ? { open: 'open' } : {}, [summary, fields]);
 
         for (let [key, val] of data) {
-            fields.appendChild(tag('li', [], {}, [displayData(val, key, expandObjects)]));
+            fields.appendChild(tag('li', [], {}, [displayData(val, key, expandNext)]));
         }
         return details;
     } else if (typeof data === "object" && !(data instanceof String)) {
@@ -142,7 +153,7 @@ export function displayData(data: any, fieldName?: string, expandObjects: boolea
         const details = tag('details', ['object-display'], expandObjects ? { open: 'open' } : {}, [summary, fields]);
 
         for (let key of keys) {
-            fields.appendChild(tag('li', [], {}, [displayData(data[key], key, expandObjects)]));
+            fields.appendChild(tag('li', [], {}, [displayData(data[key], key, expandNext)]));
         }
         return details;
     } else {
@@ -191,4 +202,65 @@ export function prettyDuration(milliseconds: number) {
     }
 
     return duration.join(":")
+}
+
+export function displaySchema(structType: StructType): HTMLElement {
+
+    function displayField(field: StructField): HTMLElement {
+        if (field.dataType instanceof ArrayType) {
+            const nameAndType = [
+                span(['field-name'], [field.name]), ': ',
+                span(['field-type'], [span(['bracket'], ['[']), field.dataType.element.typeName(), span(['bracket'], [']'])])];
+
+            let description: Content = nameAndType;
+            if (field.dataType.element instanceof StructType) {
+                description = [details([], nameAndType, [displayStruct(field.dataType.element)])]
+            } else if (field.dataType.element instanceof MapType) {
+                description = [details([], nameAndType, [displayMap(field.dataType.element)])]
+            }
+
+            return tag("li", ['object-field', 'array-field'], {}, description);
+        }
+
+        if (field.dataType instanceof StructType) {
+            return tag("li", ['object-field', 'struct-field'], {}, [
+                details([], [span(['field-name'], [field.name]), ': ', span(['field-type'], ['struct'])], [
+                    displayStruct(field.dataType)
+                ])
+            ]);
+        }
+
+        if (field.dataType instanceof MapType) {
+            return tag("li", ['object-field', 'struct-field'], {}, [
+                details([], [span(['field-name'], [field.name]), ': ', span(['field-type'], ['map'])], [
+                    displayMap(field.dataType)
+                ])
+            ]);
+        }
+
+        if (field.dataType instanceof OptionalType) {
+            return displayField(new StructField(field.name + "?", field.dataType.element));
+        }
+
+        const typeName = field.dataType.typeName();
+        const attrs = {"data-fieldType": typeName} as any;
+        return tag("li", ['object-field'], attrs, [
+            span(['field-name'], [field.name]), ': ', span(['field-type'], [typeName])
+        ]);
+    }
+
+    function displayStruct(typ: StructType): HTMLElement {
+        return tag("ul", ["object-fields"], {}, typ.fields.map(displayField));
+    }
+
+    function displayMap(typ: MapType): HTMLElement {
+        return tag("ul", ["object-fields", "map-type"], {}, [displayField(new StructField("key", typ.keyType)), displayField(new StructField("value", typ.valueType))]);
+    }
+
+    return div(['schema-display'], [
+        details(
+            ['object-display'],
+            [span(['object-summary', 'schema-summary'], [span(['summary-content', 'object-field-summary'], [truncate(structType.fields.map(f => f.name).join(", "), 64)])])],
+            [tag("ul", ['object-fields'], {}, structType.fields.map(displayField))]).attr('open', 'open')
+    ]);
 }
