@@ -1,0 +1,17 @@
+target
+out
+dist
+node_modules
+/notebooks/
+libjep.dylib
+.idea
+.DS_Store
+/*.yml
+scripts/dist-config.yml
+*.zip
+tmp/
+config.yml
+metastore_db
+*.log
+tmp
+npm-debug.log.*
